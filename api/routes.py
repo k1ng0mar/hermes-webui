@@ -15054,6 +15054,14 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/transcribe":
         return handle_transcribe(handler)
 
+    if parsed.path == "/api/voice/stt-chunk":
+        from api.stt_chunk import handle_stt_chunk
+        return handle_stt_chunk(handler, parsed)
+
+    if parsed.path == "/api/voice/stt-final":
+        from api.stt_chunk import handle_stt_final
+        return handle_stt_final(handler, parsed)
+
     if parsed.path == "/api/tts":
         return _handle_tts(handler, parsed)
 

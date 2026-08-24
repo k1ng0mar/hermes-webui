@@ -39,6 +39,22 @@ _OPENAI_VOICES = [
     {"id": "shimmer", "name": "Shimmer"},
 ]
 
+# Deepgram Aura voices — fixed set
+_DEEPGRAM_VOICES = [
+    {"id": "asteria", "name": "Asteria (female)"},
+    {"id": "luna", "name": "Luna (female)"},
+    {"id": "stella", "name": "Stella (female)"},
+    {"id": "athena", "name": "Athena (female)"},
+    {"id": "hera", "name": "Hera (female)"},
+    {"id": "orion", "name": "Orion (male)"},
+    {"id": "arcas", "name": "Arcas (male)"},
+    {"id": "perseus", "name": "Perseus (male)"},
+    {"id": "angus", "name": "Angus (male)"},
+    {"id": "orpheus", "name": "Orpheus (male)"},
+    {"id": "helios", "name": "Helios (male)"},
+    {"id": "zeus", "name": "Zeus (male)"},
+]
+
 
 def j(handler, obj, status=200):
     handler.send_response(status)
@@ -64,6 +80,35 @@ def handle_tts_voices(handler, parsed):
 
     if engine == "openai":
         return j(handler, {"voices": _OPENAI_VOICES})
+
+    if engine == "deepgram":
+        return j(handler, {"voices": _DEEPGRAM_VOICES})
+
+    if engine == "fish":
+        # Fish Audio reference voices — fetch from API if key present
+        if not key:
+            return j(handler, {"voices": []})
+        try:
+            req = urllib.request.Request("https://api.fish.audio/v1/voices")
+            req.add_header("Authorization", f"Bearer {key}")
+            req.add_header("Accept", "application/json")
+            resp = urllib.request.urlopen(req, timeout=10)
+            body = json.loads(resp.read())
+            raw = body.get("data") if isinstance(body, dict) else body
+            if not isinstance(raw, list):
+                raw = []
+            voices = []
+            for v in raw:
+                if isinstance(v, dict):
+                    vid = v.get("id") or v.get("voice_id") or v.get("name")
+                    if vid:
+                        voices.append({
+                            "id": str(vid),
+                            "name": str(v.get("name") or v.get("title") or vid),
+                        })
+            return j(handler, {"voices": voices})
+        except Exception as e:
+            return bad(handler, f"fish voice list failed: {e}", 502)
 
     # Custom / generic OpenAI-compatible — try to list voices from the endpoint
     if engine == "custom" and base_url:
