@@ -39,20 +39,21 @@ _OPENAI_VOICES = [
     {"id": "shimmer", "name": "Shimmer"},
 ]
 
-# Deepgram Aura voices — fixed set
+# Deepgram Aura voices — fixed set (aura-2 model)
 _DEEPGRAM_VOICES = [
-    {"id": "asteria", "name": "Asteria (female)"},
-    {"id": "luna", "name": "Luna (female)"},
-    {"id": "stella", "name": "Stella (female)"},
-    {"id": "athena", "name": "Athena (female)"},
-    {"id": "hera", "name": "Hera (female)"},
-    {"id": "orion", "name": "Orion (male)"},
-    {"id": "arcas", "name": "Arcas (male)"},
-    {"id": "perseus", "name": "Perseus (male)"},
-    {"id": "angus", "name": "Angus (male)"},
-    {"id": "orpheus", "name": "Orpheus (male)"},
-    {"id": "helios", "name": "Helios (male)"},
-    {"id": "zeus", "name": "Zeus (male)"},
+    {"id": "aura-2-asteria-en", "name": "Asteria (female)"},
+    {"id": "aura-2-luna-en", "name": "Luna (female)"},
+    {"id": "aura-2-stella-en", "name": "Stella (female)"},
+    {"id": "aura-2-athena-en", "name": "Athena (female)"},
+    {"id": "aura-2-hera-en", "name": "Hera (female)"},
+    {"id": "aura-2-orion-en", "name": "Orion (male)"},
+    {"id": "aura-2-arcas-en", "name": "Arcas (male)"},
+    {"id": "aura-2-perseus-en", "name": "Perseus (male)"},
+    {"id": "aura-2-angus-en", "name": "Angus (male)"},
+    {"id": "aura-2-orpheus-en", "name": "Orpheus (male)"},
+    {"id": "aura-2-helios-en", "name": "Helios (male)"},
+    {"id": "aura-2-zeus-en", "name": "Zeus (male)"},
+    {"id": "aura-2-amalthea-en", "name": "Amalthea (female)"},
 ]
 
 

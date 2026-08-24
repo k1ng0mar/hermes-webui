@@ -45,6 +45,10 @@ def _handle_tts_stream(handler, parsed):
     if engine == "edge":
         _handle_edge_stream(handler, text, voice, rate_str, pitch_str)
         return True
+    # elevenlabs — streaming via /v1/text-to-speech/{voice}/stream
+    if engine == "elevenlabs":
+        _handle_elevenlabs_stream(handler, text, voice, api_key, base_url)
+        return True
     # deepgram — POST /v1/speak with api key
     if engine == "deepgram":
         _handle_deepgram_stream(handler, text, voice, api_key)
@@ -111,14 +115,20 @@ def _handle_edge_stream(handler, text, voice, rate_str, pitch_str):
 
 
 def _handle_deepgram_stream(handler, text, voice, api_key):
-    """Stream Deepgram TTS (POST /v1/speak, Authorization: Token)."""
+    """Stream Deepgram TTS (POST /v1/speak, model=aura-2-{voice}-{lang})."""
+    import re as _re
     import urllib.request as _urlreq
 
     if not api_key:
         from api.helpers import bad as _bad
         return _bad(handler, "Deepgram API key required", 400)
     try:
-        url = f"https://api.deepgram.com/v1/speak?model=aura-2&voice={voice}"
+        # Voice id is the full model, e.g. "aura-2-amalthea-en" or "aura-2-thalia-en"
+        voice_id = (voice or "aura-2-thalia-en").strip()
+        if not _re.fullmatch(r'[A-Za-z0-9_-]+', voice_id):
+            from api.helpers import bad as _bad
+            return _bad(handler, "invalid voice id", 400)
+        url = f"https://api.deepgram.com/v1/speak?model={voice_id}"
         payload = {"text": text}
         req = _urlreq.Request(
             url,
@@ -217,4 +227,54 @@ def _handle_openai_stream(handler, text, voice, api_key, base_url):
     except Exception:
         import traceback as _tb
         print("[webui] tts-stream openai error: " + _tb.format_exc(), flush=True)
+        _finish_chunked(handler)
+
+
+def _handle_elevenlabs_stream(handler, text, voice, api_key, base_url):
+    """Stream ElevenLabs TTS (POST /v1/text-to-speech/{voice}/stream)."""
+    import re as _re
+    import json as _json
+    import urllib.request as _urlreq
+
+    if not api_key:
+        from api.helpers import bad as _bad
+        return _bad(handler, "ElevenLabs API key required", 400)
+
+    voice_id = voice or "pNInz6obpgDQGcFmaJgB"
+    if not _re.fullmatch(r'[A-Za-z0-9_-]+', voice_id):
+        from api.helpers import bad as _bad
+        return _bad(handler, "invalid voice_id", 400)
+
+    try:
+        base = (base_url or "https://api.elevenlabs.io").rstrip("/")
+        url = f"{base}/v1/text-to-speech/{voice_id}/stream?output_format=mp3_44100_128"
+        payload = {
+            "text": text,
+            "model_id": "eleven_multilingual_v2",
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+        }
+        req = _urlreq.Request(
+            url,
+            data=_json.dumps(payload).encode("utf-8"),
+            headers={
+                "xi-api-key": api_key,
+                "Content-Type": "application/json",
+                "Accept": "audio/mpeg",
+            },
+            method="POST",
+        )
+        _send_chunked_headers(handler)
+        with _urlreq.urlopen(req, timeout=60) as resp:
+            while True:
+                chunk = resp.read(4096)
+                if not chunk:
+                    break
+                try:
+                    _write_chunk(handler, chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    break
+        _finish_chunked(handler)
+    except Exception:
+        import traceback as _tb
+        print("[webui] tts-stream elevenlabs error: " + _tb.format_exc(), flush=True)
         _finish_chunked(handler)
