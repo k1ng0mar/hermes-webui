@@ -1236,12 +1236,18 @@ def _gateway_status_payload() -> dict:
         norm = _normalize_messaging_source(raw)
         if norm:
             platforms_set.add(norm)
+    # The WebUI is itself a gateway surface: whenever the gateway is up, the
+    # web surface is serving. It never writes a gateway_state.json platform
+    # entry, so it is added here rather than read from identity_map.
+    if running:
+        platforms_set.add("webui")
     platform_labels = {
         "telegram": "Telegram",
         "discord": "Discord",
         "slack": "Slack",
         "email": "Email",
         "web": "Web",
+        "webui": "WebUI",
         "api": "API",
     }
     platforms = sorted(
