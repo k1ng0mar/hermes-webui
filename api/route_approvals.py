@@ -767,6 +767,11 @@ def submit_gateway_pending_mirror(session_key: str, approval: dict) -> tuple[dic
         head, total, _changed = reconcile_gateway_pending_mirror_locked(session_key)
         _approval_sse_notify_locked(session_key, head, total)
     publish_session_list_changed("attention_pending")
+    try:
+        from api.nyx_push import notify
+        notify("approval", "Nyx needs approval", "A tool is waiting on you.", session_key)
+    except Exception:
+        pass
     return (dict(head) if head else None), total
 
 
@@ -945,6 +950,11 @@ def submit_pending(session_key: str, approval: dict) -> None:
         # notify arriving before T1's earlier notify with a stale count).
         _approval_sse_notify_locked(session_key, head, total)
     publish_session_list_changed("attention_pending")
+    try:
+        from api.nyx_push import notify
+        notify("approval", "Nyx needs approval", "A tool is waiting on you.", session_key)
+    except Exception:
+        pass
     # NOTE: We do NOT call _submit_pending_raw here — that function overwrites
     # _pending[session_key] with a single dict, which would undo the list we just
     # built. The gateway blocking path uses _gateway_queues (a separate mechanism

@@ -1848,6 +1848,11 @@ def _run_cron_tracked(
     finally:
         _mark_cron_done(job_id)
         _publish_session_list_changed("cron_complete", profile=event_profile)
+        try:
+            from api.nyx_push import notify
+            notify("cron", "Cron finished", str(job.get("name") or job_id), None)
+        except Exception:
+            pass
 
 _PROVIDER_ALIASES = {
     "claude": "anthropic",
@@ -13375,6 +13380,77 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/transcribe/capability":
         return handle_transcribe_capability(handler)
 
+    if parsed.path == "/api/llm-router/pools" and handler.command == "GET":
+        from api.llm_router_proxy import handle_llm_router_get
+        return handle_llm_router_get(handler)
+    if parsed.path == "/api/llm-router/models":
+        from api.llm_router_proxy import handle_llm_router_models
+        return handle_llm_router_models(handler, parsed)
+    if parsed.path == "/api/llm-router/logs":
+        from api.llm_router_proxy import handle_llm_router_logs
+        return handle_llm_router_logs(handler, parsed)
+
+    if parsed.path == "/api/tts/voices":
+        from api.tts_voices import handle_tts_voices
+        return handle_tts_voices(handler, parsed)
+    if parsed.path == "/api/nyx/routing":
+        from api.nyx_routing import handle_get as handle_nyx_routing
+        return handle_nyx_routing(handler)
+    if parsed.path == "/api/nyx/models":
+        from api.nyx_routing import handle_models
+        return handle_models(handler, parsed)
+
+    if parsed.path == "/api/nyx/push/status":
+        from api.nyx_push import handle_status
+        return handle_status(handler)
+
+    if parsed.path == "/api/nyx/manifest":
+        from api.nyx_manifest import handle_get
+        return handle_get(handler)
+
+    if parsed.path == "/api/nyx/memory/backends":
+        from api.nyx_memory import handle_backends
+        return handle_backends(handler)
+
+    if parsed.path == "/api/nyx/memory":
+        from api.nyx_memory import handle_read
+        payload = handle_read(handler, parsed)
+        if payload is not None:
+            return payload
+        return _handle_memory_read(handler, parsed)
+
+    if parsed.path.startswith("/api/nyx/preview/"):
+        from api.nyx_preview import handle_preview
+        return handle_preview(handler, parsed)
+
+    if parsed.path == "/api/nyx/quota":
+        from api.nyx_ops import handle_quota_get
+        return handle_quota_get(handler)
+    if parsed.path == "/api/nyx/skills/hub":
+        from api.nyx_ops import handle_skills_hub
+        return handle_skills_hub(handler, parsed)
+    if parsed.path == "/api/nyx/mcp/catalog":
+        from api.nyx_ops import handle_mcp_catalog
+        return handle_mcp_catalog(handler)
+    if parsed.path == "/api/nyx/curator":
+        from api.nyx_ops import handle_curator_get
+        return handle_curator_get(handler)
+    if parsed.path == "/api/nyx/goals":
+        from api.nyx_ops import handle_goals_get
+        return handle_goals_get(handler)
+    if parsed.path == "/api/nyx/heartbeats":
+        from api.nyx_ops import handle_heartbeats_get
+        return handle_heartbeats_get(handler)
+    if parsed.path == "/api/nyx/browser/state":
+        from api.nyx_browser import handle_state
+        return handle_state(handler)
+    if parsed.path == "/api/nyx/browser/frame.jpg":
+        from api.nyx_browser import handle_frame
+        return handle_frame(handler)
+    if parsed.path == "/api/nyx/analytics":
+        from api.nyx_analytics import handle_analytics
+        return handle_analytics(handler, parsed)
+
     if parsed.path == "/api/reasoning":
         # Current reasoning config (shared source of truth with the CLI —
         # reads display.show_reasoning and agent.reasoning_effort from
@@ -14202,6 +14278,16 @@ def handle_get(handler, parsed) -> bool:
 
     if parsed.path == "/api/list":
         return _handle_list_dir(handler, parsed)
+
+    if parsed.path == "/api/artifacts":
+        return _handle_artifacts(handler, parsed)
+
+    if parsed.path == "/api/thumbnail":
+        return _handle_thumbnail(handler, parsed)
+
+    if parsed.path == "/api/voice/tts-stream":
+        from api.tts_stream import _handle_tts_stream
+        return _handle_tts_stream(handler, parsed)
 
     if parsed.path == "/api/escape/list":
         return _handle_escape_list_dir(handler, parsed)
@@ -16380,6 +16466,106 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/bg-task-complete-ack":
         return _handle_bg_task_complete_ack(handler, body)
 
+    if parsed.path == "/api/llm-router/pools":
+        from api.llm_router_proxy import handle_llm_router_set_pool
+        return handle_llm_router_set_pool(handler, body)
+    if parsed.path == "/api/llm-router/providers":
+        from api.llm_router_proxy import handle_llm_router_set_provider
+        return handle_llm_router_set_provider(handler, body)
+    if parsed.path == "/api/nyx/routing/primary":
+        from api.nyx_routing import handle_primary
+        return handle_primary(handler, body)
+    if parsed.path == "/api/nyx/routing/fallback":
+        from api.nyx_routing import handle_fallback
+        return handle_fallback(handler, body)
+    if parsed.path == "/api/nyx/routing/aux":
+        from api.nyx_routing import handle_aux
+        return handle_aux(handler, body)
+    if parsed.path == "/api/nyx/routing/key":
+        from api.nyx_routing import handle_key
+        return handle_key(handler, body)
+    if parsed.path == "/api/nyx/routing/pool":
+        from api.nyx_routing import handle_pool_add
+        return handle_pool_add(handler, body)
+    if parsed.path == "/api/nyx/routing/pool/remove":
+        from api.nyx_routing import handle_pool_remove
+        return handle_pool_remove(handler, body)
+    if parsed.path == "/api/nyx/mcp/tool":
+        from api.nyx_routing import handle_mcp_tool
+        return handle_mcp_tool(handler, body)
+    if parsed.path == "/api/nyx/mcp/server":
+        name = str(body.get("name") or "").strip()
+        return _handle_mcp_server_toggle(handler, name, body)
+    if parsed.path == "/api/llm-router/fallback":
+        from api.llm_router_proxy import handle_llm_router_set_fallback
+        return handle_llm_router_set_fallback(handler, body)
+    if parsed.path == "/api/llm-router/keys":
+        from api.llm_router_proxy import handle_llm_router_add_key
+        return handle_llm_router_add_key(handler, body)
+
+    if parsed.path == "/api/nyx/push/register":
+        from api.nyx_push import handle_register
+        return handle_register(handler, body)
+    if parsed.path == "/api/nyx/push/config":
+        from api.nyx_push import handle_config
+        return handle_config(handler, body)
+    if parsed.path == "/api/nyx/push/test":
+        from api.nyx_push import handle_test
+        return handle_test(handler, body)
+
+    if parsed.path == "/api/nyx/manifest":
+        from api.nyx_manifest import handle_propose
+        return handle_propose(handler, body)
+    if parsed.path == "/api/nyx/manifest/apply":
+        from api.nyx_manifest import handle_apply
+        return handle_apply(handler, body)
+    if parsed.path == "/api/nyx/manifest/reject":
+        from api.nyx_manifest import handle_reject
+        return handle_reject(handler, body)
+
+    if parsed.path == "/api/nyx/quota":
+        from api.nyx_ops import handle_quota_refresh
+        return handle_quota_refresh(handler, body)
+    if parsed.path == "/api/nyx/skills/hub/install":
+        from api.nyx_ops import handle_skills_install
+        return handle_skills_install(handler, body)
+    if parsed.path == "/api/nyx/mcp/install":
+        from api.nyx_ops import handle_mcp_install
+        return handle_mcp_install(handler, body)
+    if parsed.path == "/api/nyx/curator":
+        from api.nyx_ops import handle_curator_post
+        return handle_curator_post(handler, body)
+    if parsed.path == "/api/nyx/heartbeats":
+        from api.nyx_ops import handle_heartbeat_set
+        return handle_heartbeat_set(handler, body)
+    if parsed.path == "/api/nyx/goals":
+        from api.nyx_ops import handle_goal_action
+        return handle_goal_action(handler, body)
+    if parsed.path == "/api/nyx/goals/create":
+        from api.nyx_ops import handle_goal_create
+        return handle_goal_create(handler, body)
+    if parsed.path == "/api/nyx/browser/open":
+        from api.nyx_browser import handle_open
+        return handle_open(handler, body)
+    if parsed.path == "/api/nyx/browser/click":
+        from api.nyx_browser import handle_click
+        return handle_click(handler, body)
+    if parsed.path == "/api/nyx/browser/type":
+        from api.nyx_browser import handle_type
+        return handle_type(handler, body)
+    if parsed.path == "/api/nyx/browser/key":
+        from api.nyx_browser import handle_key
+        return handle_key(handler, body)
+    if parsed.path == "/api/nyx/browser/scroll":
+        from api.nyx_browser import handle_scroll
+        return handle_scroll(handler, body)
+    if parsed.path == "/api/nyx/browser/back":
+        from api.nyx_browser import handle_back
+        return handle_back(handler, body)
+    if parsed.path == "/api/nyx/browser/close":
+        from api.nyx_browser import handle_close
+        return handle_close(handler, body)
+
     if parsed.path == "/api/chat/start":
         return _handle_chat_start(handler, body, diag=diag)
 
@@ -17989,6 +18175,74 @@ def _handle_sessions_search(handler, parsed):
         "all_profiles": all_profiles,
         "active_profile": active_profile,
     })
+
+
+def _handle_artifacts(handler, parsed):
+    """List real artifacts (type-aware, recency-sorted, noise-filtered)."""
+    qs = parse_qs(parsed.query)
+    sid = qs.get("session_id", [""])[0]
+    if not sid:
+        return bad(handler, "session_id is required")
+    s = None
+    workspace = ""
+    try:
+        s = get_session(sid)
+        workspace = s.workspace
+    except KeyError:
+        try:
+            cli_meta = None
+            for cs in get_cli_sessions():
+                if cs["session_id"] == sid:
+                    cli_meta = cs
+                    break
+            if not cli_meta:
+                return bad(handler, "Session not found", 404)
+            workspace = cli_meta.get("workspace", "")
+        except Exception:
+            return bad(handler, "Session not found", 404)
+    try:
+        from api.artifacts import artifact_from_entry
+        workspace = resolve_trusted_workspace(workspace) if s is None else Path(
+            resolve_implicit_workspace_with_recovery(workspace, get_last_workspace)[0]
+        )
+        entries = list_dir(Path(workspace), ".")
+        artifacts = [a for e in entries if (a := artifact_from_entry(e))]
+        artifacts.sort(key=lambda a: (a["mtime"] or 0), reverse=True)
+        return j(handler, {"artifacts": artifacts[:60]})
+    except Exception as e:
+        return bad(handler, _sanitize_error(e), 500)
+
+
+def _handle_thumbnail(handler, parsed):
+    """Serve a downscaled image thumbnail for the artifact grid."""
+    qs = parse_qs(parsed.query)
+    sid = qs.get("session_id", [""])[0]
+    rel = qs.get("path", [""])[0]
+    if not sid or not rel:
+        return bad(handler, "session_id and path are required")
+    try:
+        s = get_session_for_file_ops(sid)
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+    try:
+        from api.thumbnails import make_thumbnail
+        from api.workspace import safe_resolve_ws
+        target = safe_resolve_ws(Path(s.workspace), rel)
+        if not target.is_file():
+            return bad(handler, "not found", 404)
+        thumb = make_thumbnail(target)
+        if thumb is None:
+            return bad(handler, "not an image", 415)
+        data, mime = thumb
+        handler.send_response(200)
+        handler.send_header("Content-Type", mime)
+        handler.send_header("Content-Length", str(len(data)))
+        handler.send_header("Cache-Control", "no-store")
+        handler.end_headers()
+        handler.wfile.write(data)
+        return None
+    except Exception as e:
+        return bad(handler, _sanitize_error(e), 500)
 
 
 def _handle_list_dir(handler, parsed):
@@ -20045,8 +20299,8 @@ def _handle_tts(handler, parsed):
         return True
 
     # ── OpenAI-compatible TTS ──────────────────────────────────────────
-    if engine == "openai":
-        api_key = os.getenv("VOICE_TOOLS_OPENAI_KEY", "").strip()
+    if engine == "openai" or engine == "custom":
+        api_key = (data.get("key") or "").strip() or os.getenv("VOICE_TOOLS_OPENAI_KEY", "").strip()
         if not api_key:
             api_key = os.getenv("OPENAI_API_KEY", "").strip()
         if not api_key:
@@ -20059,13 +20313,13 @@ def _handle_tts(handler, parsed):
                 pass
         if not api_key:
             from api.helpers import bad as _bad
-            return _bad(handler, "OpenAI API key not configured", 503)
+            return _bad(handler, "API key not configured", 503)
 
         from urllib.parse import urlunsplit as _urlunsplit
 
-        base_url = _urlunsplit(("https", "api.openai.com", "/v1", "", ""))
+        base_url = (data.get("base_url") or "").strip() or _urlunsplit(("https", "api.openai.com", "/v1", "", ""))
         model = "gpt-4o-mini-tts"
-        oai_voice = "alloy"
+        oai_voice = data.get("voice") or "alloy"
         try:
             from api.config import get_config
             tts_cfg = (get_config() or {}).get("tts", {})

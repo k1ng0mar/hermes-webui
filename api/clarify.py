@@ -161,6 +161,11 @@ def submit_pending(session_key: str, data: dict) -> _ClarifyEntry:
                 # Safe to call while holding _lock: publish() only takes the
                 # leaf _SESSION_EVENTS_LOCK and never re-acquires this lock.
                 publish_session_list_changed("attention_pending")
+                try:
+                    from api.nyx_push import notify
+                    notify("clarify", "Nyx has a question", "The agent needs a clarification.", session_key)
+                except Exception:
+                    pass
                 return entry
 
         entry = _ClarifyEntry(data)
@@ -172,6 +177,11 @@ def submit_pending(session_key: str, data: dict) -> _ClarifyEntry:
         # Notify SSE subscribers from inside _lock for ordering guarantees.
         _clarify_sse_notify(session_key, dict(gw_queue[0].data), len(gw_queue))
     publish_session_list_changed("attention_pending")
+    try:
+        from api.nyx_push import notify
+        notify("clarify", "Nyx has a question", "The agent needs a clarification.", session_key)
+    except Exception:
+        pass
     if cb:
         try:
             cb(data)
