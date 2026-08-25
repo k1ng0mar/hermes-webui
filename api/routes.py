@@ -11079,7 +11079,7 @@ _LOG_FILE_WHITELIST = {
     "errors": "errors.log",
     "gateway": "gateway.log",
 }
-_LOG_TAIL_VALUES = {100, 200, 500, 1000}
+_LOG_TAIL_VALUES = {50, 100, 200, 250, 500, 1000}
 _LOG_DEFAULT_TAIL = 200
 _LOG_MAX_BYTES = 4 * 1024 * 1024
 
@@ -12880,6 +12880,10 @@ def handle_get(handler, parsed) -> bool:
     if proxy_result is not False:
         return proxy_result
 
+    if parsed.path == "/api/voice/stt-providers":
+        from api.stt_chunk import handle_stt_providers
+        return handle_stt_providers(handler, parsed, "GET")
+
     if parsed.path.startswith("/session/static/"):
         # Strip the leading "/session" so _serve_static() sees a path that
         # starts with "/static/" (its required prefix). _serve_static enforces
@@ -13418,6 +13422,10 @@ def handle_get(handler, parsed) -> bool:
         from api.nyx_memory import handle_backends
         return handle_backends(handler)
 
+    if parsed.path == "/api/nyx/memory/graph":
+        from api.nyx_memory_graph import handle_graph
+        return handle_graph(handler, parsed)
+
     if parsed.path == "/api/nyx/memory":
         from api.nyx_memory import handle_read
         payload = handle_read(handler, parsed)
@@ -13447,6 +13455,12 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/nyx/heartbeats":
         from api.nyx_ops import handle_heartbeats_get
         return handle_heartbeats_get(handler)
+    if parsed.path == "/api/nyx/commands/pending":
+        from api.nyx_commands import handle_pending
+        return handle_pending(handler, parsed)
+    if parsed.path == "/api/nyx/commands/status":
+        from api.nyx_commands import handle_status
+        return handle_status(handler)
     if parsed.path == "/api/nyx/browser/state":
         from api.nyx_browser import handle_state
         return handle_state(handler)
@@ -14980,6 +14994,7 @@ def _resolve_new_session_workspace(body, visible_prev_session_id):
     )
     return str(workspace)
 
+
 def handle_post(handler, parsed) -> bool:
     """Handle all POST routes. Returns True if handled, False for 404."""
     diag = RequestDiagnostics.maybe_start("POST", parsed.path, logger=logger, print_fn=getattr(handler, '_safe_webui_print', None))
@@ -15067,6 +15082,10 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/voice/stt-final":
         from api.stt_chunk import handle_stt_final
         return handle_stt_final(handler, parsed)
+
+    if parsed.path == "/api/voice/stt-providers":
+        from api.stt_chunk import handle_stt_providers
+        return handle_stt_providers(handler, parsed, handler.command)
 
     if parsed.path == "/api/tts":
         return _handle_tts(handler, parsed)
@@ -16483,6 +16502,9 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/llm-router/pools":
         from api.llm_router_proxy import handle_llm_router_set_pool
         return handle_llm_router_set_pool(handler, body)
+    if parsed.path == "/api/llm-router/default":
+        from api.llm_router_proxy import handle_llm_router_set_default
+        return handle_llm_router_set_default(handler, body)
     if parsed.path == "/api/llm-router/providers":
         from api.llm_router_proxy import handle_llm_router_set_provider
         return handle_llm_router_set_provider(handler, body)
@@ -16552,6 +16574,12 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/nyx/heartbeats":
         from api.nyx_ops import handle_heartbeat_set
         return handle_heartbeat_set(handler, body)
+    if parsed.path == "/api/nyx/commands":
+        from api.nyx_commands import handle_enqueue
+        return handle_enqueue(handler, body)
+    if parsed.path == "/api/nyx/commands/ack":
+        from api.nyx_commands import handle_ack
+        return handle_ack(handler, body)
     if parsed.path == "/api/nyx/goals":
         from api.nyx_ops import handle_goal_action
         return handle_goal_action(handler, body)
@@ -17855,6 +17883,9 @@ def handle_delete(handler, parsed) -> bool:
     )
     if proxy_result is not False:
         return proxy_result
+    if parsed.path == "/api/voice/stt-providers":
+        from api.stt_chunk import handle_stt_providers
+        return handle_stt_providers(handler, parsed, "DELETE")
     body = read_body(handler)
     if not _guard_request_session_visibility(handler, parsed, body=body, method="DELETE"):
         return True
@@ -28872,8 +28903,36 @@ def _server_summary(name, cfg, runtime_status=None):
         out["status"] = "active"
     else:
         out["status"] = "configured"
-    out["tool_count"] = runtime_status.get("tools") if runtime_status else None
+    # Use the live runtime tool count only when the server is actually
+    # connected (status "active") — there a live 0 is truthful. When the
+    # server is merely configured/enabled but not connected, the runtime
+    # reports 0 because nothing is loaded yet; fall back to the cached
+    # schema probe so the phone shows the real capability (e.g. 48), not a
+    # misleading 0. The cache is None only if we never probed it.
+    rt = runtime_status.get("tools") if runtime_status else None
+    cached = _mcp_cached_tool_count(name)
+    if out.get("status") == "active" and rt is not None:
+        out["tool_count"] = rt
+    else:
+        out["tool_count"] = cached if cached is not None else (rt if rt is not None else None)
     return out
+
+
+def _mcp_cached_tool_count(name: str):
+    """Number of tools from the last successful MCP schema probe, if cached."""
+    try:
+        import os
+        cache_path = os.path.join(os.path.expanduser("~"), ".hermes", "cache", "mcp_schema_cache.json")
+        if not os.path.isfile(cache_path):
+            return None
+        data = json.loads(open(cache_path).read() or "{}")
+        entry = data.get(name)
+        if isinstance(entry, dict):
+            tools = entry.get("tools")
+            return len(tools) if isinstance(tools, list) else None
+    except Exception:
+        return None
+    return None
 
 
 def _mcp_safe_display_text(value, *, limit: int) -> str:

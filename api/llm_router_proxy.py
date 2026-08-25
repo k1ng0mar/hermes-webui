@@ -93,6 +93,36 @@ def handle_llm_router_get(handler):
         if live.get("keyTotal"):
             key_total = int(live.get("keyTotal") or key_total)
     quota = _read_quota()
+    if not quota:
+        # Fall back to Nyx resetwatch cards so the phone isn't blank when
+        # quota.json isn't wired into router.yaml yet.
+        try:
+            from api.nyx_ops import read_quota
+            nyx = read_quota() or {}
+            cards = nyx.get("cards") or []
+            if isinstance(cards, list) and cards:
+                quota = [
+                    {
+                        "id": str(c.get("id") or ""),
+                        "remaining": c.get("remaining"),
+                        "note": c.get("note") or c.get("plan") or "",
+                    }
+                    for c in cards
+                    if isinstance(c, dict) and c.get("id")
+                ]
+            elif isinstance(nyx.get("providers"), dict):
+                quota = []
+                for name, rec in nyx["providers"].items():
+                    if not isinstance(rec, dict):
+                        continue
+                    remaining = rec.get("percent_left", rec.get("remaining"))
+                    try:
+                        remaining = float(remaining) if remaining is not None else None
+                    except Exception:
+                        remaining = None
+                    quota.append({"id": str(name), "remaining": remaining, "note": rec.get("note") or rec.get("plan") or ""})
+        except Exception:
+            pass
     return j(
         handler,
         {
@@ -180,6 +210,20 @@ def handle_llm_router_logs(handler, parsed):
             "entries": entries,
         },
     )
+
+
+def handle_llm_router_set_default(handler, body):
+    if not isinstance(body, dict):
+        return bad(handler, "JSON object required")
+    pool = str(body.get("pool") or "").strip()
+    if not pool:
+        return bad(handler, "pool is required")
+    payload, err = _router_request("POST", "/api/config/default", {"pool": pool})
+    if err and payload is None:
+        return bad(handler, err, 502)
+    if payload and payload.get("error"):
+        return bad(handler, str(payload.get("error")), 400)
+    return j(handler, payload or {"ok": True, "default": pool})
 
 
 def handle_llm_router_set_pool(handler, body):

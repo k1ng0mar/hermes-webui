@@ -431,17 +431,21 @@ def handle_transcribe(handler):
         with tempfile.NamedTemporaryFile(prefix='webui-stt-', suffix=suffix, delete=False) as tmp:
             temp_path = tmp.name
             tmp.write(file_bytes)
-        try:
-            from tools.transcription_tools import transcribe_audio
-        except ImportError:
-            return j(handler, {'error': 'Speech-to-text is unavailable on this server'}, status=503)
-        result = transcribe_audio(temp_path)
-        if not result.get('success'):
-            msg = str(result.get('error') or 'Transcription failed')
-            status = 503 if 'unavailable' in msg.lower() or 'not configured' in msg.lower() else 400
-            return j(handler, {'error': msg}, status=status)
-        transcript = str(result.get('transcript') or '').strip()
-        return j(handler, {'ok': True, 'transcript': transcript})
+        # Prefer self-contained Groq STT (no hermes tools dependency);
+        # fall back to the hermes transcription_tools module if present.
+        import api.stt_chunk as _stt
+        text = _stt._transcribe_groq(temp_path, suffix)
+        if not text:
+            try:
+                from tools.transcription_tools import transcribe_audio
+                result = transcribe_audio(temp_path)
+                if result.get('success'):
+                    text = str(result.get('transcript') or '').strip()
+            except ImportError:
+                pass
+        if text:
+            return j(handler, {'ok': True, 'transcript': text})
+        return j(handler, {'error': 'Speech-to-text is unavailable on this server'}, status=503)
     except ValueError as e:
         return j(handler, {'error': str(e)}, status=400)
     except Exception:

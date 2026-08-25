@@ -910,6 +910,25 @@ def undo_last(session_id: str) -> dict[str, Any]:
     }
 
 
+def _session_context_window(s) -> int:
+    """Best-effort context window (tokens) for a session's model. 0 = unknown."""
+    model = str(getattr(s, 'model', '') or '').strip()
+    if not model:
+        return 0
+    try:
+        from agent.model_metadata import get_model_context_length as _get_cl
+        from api.config import get_config as _get_cfg
+        cfg = _get_cfg() or {}
+        base_url = getattr(s, 'base_url', None) or ''
+        api_key = getattr(s, 'api_key', None) or ''
+        provider = getattr(s, 'provider', None) or ''
+        return int(_get_cl(model, base_url, api_key=api_key,
+                           config_context_length=cfg.get('context_length'),
+                           provider=provider) or 0)
+    except Exception:
+        return 0
+
+
 def session_status(session_id: str) -> dict[str, Any]:
     """Return a snapshot of session state for /status.
 
@@ -959,6 +978,9 @@ def session_status(session_id: str) -> dict[str, Any]:
         'output_tokens': out,
         'total_tokens': inp + out,
         'estimated_cost': s.estimated_cost,
+        # Best-effort context window (tokens) for the session's model, so the
+        # client can render "used/limit" (e.g. 250.4k/256k). 0 when unknown.
+        'context_window': _session_context_window(s),
     }
 
 
