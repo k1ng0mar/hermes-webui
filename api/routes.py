@@ -13471,6 +13471,14 @@ def handle_get(handler, parsed) -> bool:
         from api.nyx_analytics import handle_analytics
         return handle_analytics(handler, parsed)
 
+    # 4b: artifact revisions (list + diff)
+    if parsed.path == "/api/nyx/revisions":
+        from api.nyx_revisions import handle_revisions_list
+        return handle_revisions_list(handler, parsed)
+    if parsed.path == "/api/nyx/revisions/diff":
+        from api.nyx_revisions import handle_revisions_diff
+        return handle_revisions_diff(handler, parsed)
+
     if parsed.path == "/api/reasoning":
         # Current reasoning config (shared source of truth with the CLI —
         # reads display.show_reasoning and agent.reasoning_effort from
@@ -16610,6 +16618,14 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/nyx/browser/snapshot":
         from api.nyx_browser import handle_snapshot
         return handle_snapshot(handler, body)
+
+    # 4b: artifact revisions (snapshot + revert)
+    if parsed.path == "/api/nyx/revisions/snapshot":
+        from api.nyx_revisions import handle_revisions_snapshot
+        return handle_revisions_snapshot(handler, body)
+    if parsed.path == "/api/nyx/revisions/revert":
+        from api.nyx_revisions import handle_revisions_revert
+        return handle_revisions_revert(handler, body)
 
     if parsed.path == "/api/chat/start":
         return _handle_chat_start(handler, body, diag=diag)
