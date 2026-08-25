@@ -23,6 +23,7 @@ WIDTH, HEIGHT = 390, 844
 _cmd: queue.Queue = queue.Queue()
 _thread: threading.Thread | None = None
 _ready = threading.Event()
+_page_holder: dict = {}  # shared with the worker so snapshot can read DOM
 _state = {"active": False, "url": "", "title": "", "width": WIDTH, "height": HEIGHT}
 _frame = b""
 _err: str | None = None
@@ -54,6 +55,7 @@ def _worker() -> None:
             ),
         )
         page = context.new_page()
+        _page_holder["page"] = page
     except Exception as e:
         _err = f"chrome launch failed: {e}"
         _ready.set()
@@ -120,6 +122,42 @@ def _worker() -> None:
             elif op == "shot":
                 snap()
                 box["ok"] = dict(_state)
+            elif op == "snapshot":
+                # Read a structured digest of the current page so the agent can
+                # resume from where the user took over. Bounded fields keep the
+                # response small even on content-heavy pages.
+                try:
+                    snap()
+                    snapshot = {
+                        "url": _state.get("url", ""),
+                        "title": _state.get("title", ""),
+                        "headings": page.evaluate(
+                            "() => Array.from(document.querySelectorAll('h1,h2,h3'))"
+                            ".slice(0, 30).map(h => h.innerText.trim()).filter(Boolean)"
+                        ),
+                        "visible_text": page.evaluate(
+                            "() => (document.body?.innerText || '')"
+                            ".replace(/\\s+/g, ' ').trim().slice(0, 4000)"
+                        ),
+                        "form_fields": page.evaluate(
+                            "() => Array.from(document.querySelectorAll('input,textarea,select'))"
+                            ".slice(0, 30).map(el => ({"
+                            "  tag: el.tagName.toLowerCase(),"
+                            "  type: el.type || null,"
+                            "  name: el.name || null,"
+                            "  id: el.id || null,"
+                            "  placeholder: el.placeholder || null,"
+                            "  value: el.value || null"
+                            "}))"
+                        ),
+                        "buttons": page.evaluate(
+                            "() => Array.from(document.querySelectorAll('button, [role=button]'))"
+                            ".slice(0, 20).map(b => b.innerText.trim()).filter(Boolean)"
+                        ),
+                    }
+                    box["ok"] = snapshot
+                except Exception as e:
+                    box["err"] = f"snapshot failed: {e}"
             else:
                 box["err"] = f"unknown op {op}"
         except Exception as e:
@@ -264,3 +302,15 @@ def handle_close(handler, body):
         _thread.join(timeout=8)
     _thread = None
     return j(handler, {"ok": True, "active": False})
+
+
+def handle_snapshot(handler, body):
+    """Read a structured page digest: url, title, headings, visible text (capped),
+    form fields, button labels. Use this when the user gives back control after
+    a take-over so the agent resumes with the user's final-page context, not
+    just the URL it last acted on."""
+    try:
+        st = _call("snapshot")
+        return j(handler, {"ok": True, **st})
+    except Exception as e:
+        return bad(handler, str(e), 503)

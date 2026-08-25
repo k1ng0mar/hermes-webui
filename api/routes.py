@@ -16607,6 +16607,9 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/nyx/browser/close":
         from api.nyx_browser import handle_close
         return handle_close(handler, body)
+    if parsed.path == "/api/nyx/browser/snapshot":
+        from api.nyx_browser import handle_snapshot
+        return handle_snapshot(handler, body)
 
     if parsed.path == "/api/chat/start":
         return _handle_chat_start(handler, body, diag=diag)
@@ -24410,6 +24413,18 @@ def _handle_chat_start(handler, body, diag=None):
                 pass
         except PermissionError:
             return bad(handler, "Read-only imported sessions cannot be continued from WebUI", 403)
+        # #409-on-continue: reap stale stream state BEFORE the active_stream check.
+        # Without this, a session whose SSE channel died (network drop, app
+        # backgrounded, server-side cancel that never reached the in-memory
+        # STREAMS dict) keeps active_stream_id set and 409s the next chat/start
+        # even though no run is actually in flight. _clear_stale_stream_state
+        # is a no-op when the stream is genuinely live, so it's safe to call
+        # on every request.
+        diag.stage("stale_stream_preflight") if diag else None
+        try:
+            _clear_stale_stream_state(s)
+        except Exception:
+            logger.warning("stale_stream_preflight failed for %s", getattr(s, "session_id", "?"), exc_info=True)
         diag.stage("validate_profile") if diag else None
         requested_profile = str(body.get("profile") or "").strip()
         active_profile = _get_active_profile_name()
