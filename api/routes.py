@@ -16903,6 +16903,11 @@ def handle_post(handler, parsed) -> bool:
                 handler,
                 "Invalid profile name: lowercase letters, numbers, hyphens, underscores only",
             )
+        # design 8b "Import from file": the client reads a SOUL.md and posts
+        # its text, so no upload path or server-side file access is involved.
+        soul_content = body.get("soul_content")
+        if soul_content is not None and not isinstance(soul_content, str):
+            return bad(handler, "soul_content must be a string")
         clone_from = body.get("clone_from")
         if clone_from is not None:
             clone_from = str(clone_from).strip()
@@ -16925,6 +16930,7 @@ def handle_post(handler, parsed) -> bool:
                 api_key=api_key,
                 default_model=default_model,
                 model_provider=model_provider,
+                soul_content=soul_content,
             )
             return j(handler, {"ok": True, "profile": result})
         except PermissionError as e:

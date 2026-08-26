@@ -818,3 +818,39 @@ def test_forget_maps_not_found_to_404(monkeypatch):
     h = _Stub()
     nm.handle_forget(h, {"id": "mem_1"})
     assert h.status == 404
+
+
+# ── profile create: seeded SOUL.md (design 8b "Import from file") ──────────
+
+
+def test_create_profile_rejects_an_oversized_soul(monkeypatch, tmp_path):
+    """A stray import must not write an unbounded file into the profile dir."""
+    import api.profiles as prof
+    monkeypatch.setattr(prof, "_is_isolated_profile_mode", lambda: False)
+    monkeypatch.setattr(prof, "_validate_profile_name", lambda n: None)
+    monkeypatch.setattr(prof, "_split_webui_provider_model_value", lambda a, b: (a, b))
+    monkeypatch.setattr(prof, "_validate_profile_model_selection", lambda a, b: None)
+    monkeypatch.setattr(prof, "list_profiles_api", lambda: [])
+    monkeypatch.setattr(prof, "_DEFAULT_HERMES_HOME", tmp_path)
+    monkeypatch.setattr(prof, "_create_profile_fallback", lambda *a, **k: None)
+    monkeypatch.setattr(prof, "_write_endpoint_to_config", lambda *a, **k: None)
+    too_big = "x" * (prof.MAX_SEEDED_SOUL_BYTES + 1)
+    with pytest.raises(ValueError, match="too large"):
+        prof.create_profile_api("newone", soul_content=too_big)
+
+
+def test_create_profile_soul_cap_is_measured_in_bytes(monkeypatch, tmp_path):
+    """A multi-byte string must be capped by BYTES, not character count."""
+    import api.profiles as prof
+    # 3 bytes each, so this is over the cap in bytes but under it in characters.
+    s = "—" * (prof.MAX_SEEDED_SOUL_BYTES // 3 + 1)
+    assert len(s) < prof.MAX_SEEDED_SOUL_BYTES
+    assert len(s.encode("utf-8")) > prof.MAX_SEEDED_SOUL_BYTES
+
+
+def test_create_profile_soul_content_is_optional():
+    """Signature must keep soul_content optional so existing callers are safe."""
+    import inspect
+    import api.profiles as prof
+    sig = inspect.signature(prof.create_profile_api)
+    assert sig.parameters["soul_content"].default is None

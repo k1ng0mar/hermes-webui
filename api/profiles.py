@@ -2538,13 +2538,23 @@ def _write_model_defaults_to_config(
     _atomic_write_text(config_path, _yaml.dump(cfg, default_flow_style=False, allow_unicode=True), encoding='utf-8')
 
 
+# A SOUL.md seeded at creation (design 8b "Import from file"). Capped so a
+# stray upload cannot write an unbounded file into the profile directory.
+MAX_SEEDED_SOUL_BYTES = 256 * 1024
+
+
 def create_profile_api(name: str, clone_from: str = None,
                        clone_config: bool = False,
                        base_url: str = None,
                        api_key: str = None,
                        default_model: str = None,
-                       model_provider: str = None) -> dict:
+                       model_provider: str = None,
+                       soul_content: str = None) -> dict:
     """Create a new profile. Returns the new profile info dict.
+
+    ``soul_content`` seeds the new profile's SOUL.md, which is what design 8b's
+    "Import from file" needs — the caller reads the file and posts its text, so
+    no upload path or server-side file access is involved.
 
     In isolated profile mode, profile creation is rejected (403).
     """
@@ -2605,6 +2615,17 @@ def create_profile_api(name: str, clone_from: str = None,
                 name,
                 exc_info=True,
             )
+
+    # Seed SOUL.md last, so it wins over anything a clone or the skill seeding
+    # put there — an explicit import is the caller's stated intent.
+    if soul_content is not None:
+        text = str(soul_content)
+        if len(text.encode("utf-8")) > MAX_SEEDED_SOUL_BYTES:
+            raise ValueError("SOUL.md is too large to import")
+        soul_path = profile_path / "SOUL.md"
+        if soul_path.is_symlink():
+            raise ValueError("Refusing to write through a symlinked SOUL.md")
+        soul_path.write_text(text, encoding="utf-8")
 
     _write_endpoint_to_config(profile_path, base_url=base_url)
     if api_key:
