@@ -590,3 +590,92 @@ def test_graph_caps_concurrent_builds(monkeypatch):
 
     assert len(spawned) == g._MAX_INFLIGHT
     assert g._MAX_INFLIGHT <= 4
+
+
+# ── nyx_analytics: per-day cost was always zero ─────────────────────────────
+
+
+@pytest.fixture
+def usage_db(tmp_path, monkeypatch):
+    """A state.db with session_model_usage rows across two days."""
+    import sqlite3
+    import time as _time
+    import api.nyx_analytics as an
+
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(str(db))
+    con.execute(
+        """CREATE TABLE session_model_usage (
+               model TEXT, billing_provider TEXT, api_call_count INT,
+               input_tokens INT, output_tokens INT, cache_read_tokens INT,
+               cache_write_tokens INT, reasoning_tokens INT,
+               last_seen REAL, estimated_cost_usd REAL, cost_status TEXT)"""
+    )
+    now = _time.time()
+    rows = [
+        ("opus", "anthropic", 3, 1_000_000, 2000, 0, 0, 0, now - 3600, 2.50, "actual"),
+        ("opus", "anthropic", 1, 1_000_000, 500, 0, 0, 0, now - 90000, 1.25, "actual"),
+        ("sonnet", "anthropic", 5, 2_000_000, 900, 0, 0, 0, now - 3600, 0.75, "estimated"),
+    ]
+    con.executemany(
+        "INSERT INTO session_model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows
+    )
+    con.commit()
+    con.close()
+    monkeypatch.setattr(an, "STATE_DB", db)
+    return db
+
+
+def _analytics(days=30):
+    from urllib.parse import urlparse
+    from api.nyx_analytics import handle_analytics
+    h = _Stub()
+    handle_analytics(h, urlparse(f"/api/nyx/analytics?days={days}"))
+    return h.payload()
+
+
+def test_analytics_series_carries_real_per_day_cost(usage_db):
+    """`by_day` was declared and read but never written, so every series entry
+    reported cost 0.0 no matter what had actually been spent."""
+    data = _analytics()
+    assert data["series"], "expected at least one day in the series"
+    assert sum(p["cost"] for p in data["series"]) > 0
+    assert data["spend"] == pytest.approx(sum(p["cost"] for p in data["series"]), rel=1e-3)
+
+
+def test_analytics_series_days_are_sorted_and_unique(usage_db):
+    days = [p["day"] for p in _analytics()["series"]]
+    assert days == sorted(days)
+    assert len(days) == len(set(days))
+
+
+def test_analytics_totals_are_consistent(usage_db):
+    data = _analytics()
+    # fixture: input 4,000,000 / output 3,400 / no cache or reasoning tokens
+    assert data["input_tokens"] == 4_000_000
+    assert data["output_tokens"] == 3_400
+    assert data["tokens"] == 4_003_400
+    assert data["calls"] == 9
+    assert data["spend"] == pytest.approx(4.50, rel=1e-3)
+
+
+def test_analytics_every_model_has_share_and_rounded_cost(usage_db):
+    """The loop only touched models[:20] while the full list was returned, so
+    anything past the 20th came back unrounded and without a `share` key."""
+    for m in _analytics()["models"]:
+        assert "share" in m
+        assert m["cost"] == round(m["cost"], 2)
+
+
+def test_analytics_days_param_is_clamped(usage_db):
+    assert _analytics(days=99999)["days"] == 365
+    assert _analytics(days=0)["days"] == 1
+
+
+def test_analytics_survives_a_garbage_days_param(usage_db):
+    from urllib.parse import urlparse
+    from api.nyx_analytics import handle_analytics
+    h = _Stub()
+    handle_analytics(h, urlparse("/api/nyx/analytics?days=abc"))
+    assert h.status == 200
+    assert h.payload()["days"] == 30

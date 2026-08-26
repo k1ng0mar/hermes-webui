@@ -53,14 +53,13 @@ from __future__ import annotations
 import base64
 import difflib
 import json
-import os
 import re
 import threading
 import time
 from pathlib import Path
-from urllib.parse import parse_qs, unquote
+from urllib.parse import parse_qs
 
-from api.helpers import bad, j, read_body, safe_resolve
+from api.helpers import bad, j, safe_resolve
 from api.nyx_store import atomic_write_bytes, atomic_write_text
 
 # Configurable caps. Keep the working set small — old revisions fall
@@ -122,7 +121,7 @@ def _resolve_workspace(sid: str) -> tuple[Path, dict | None]:
     falls back to the CLI session registry. Raises KeyError when the
     session is unknown.
     """
-    from api.models import get_session, get_session_for_file_ops
+    from api.models import get_session
 
     s = None
     workspace = ""
@@ -141,8 +140,8 @@ def _resolve_workspace(sid: str) -> tuple[Path, dict | None]:
             if not cli_meta:
                 raise KeyError(sid)
             workspace = cli_meta.get("workspace", "")
-        except Exception:
-            raise KeyError(sid)
+        except Exception as exc:
+            raise KeyError(sid) from exc
 
     # Trust the workspace unless we have no in-memory session.
     from api.workspace import (

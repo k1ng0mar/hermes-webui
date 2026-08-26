@@ -9,9 +9,14 @@ import time
 from collections import defaultdict
 from urllib.parse import parse_qs
 
-from api.helpers import bad, j
+from api.helpers import j
 
 STATE_DB = None  # resolved lazily like nyx_ops
+
+
+# state.db is written concurrently by the agent; sqlite's default 5s busy
+# timeout turns a contended read into a 500 on this endpoint.
+_DB_TIMEOUT_S = 15.0
 
 
 def _db():
@@ -23,6 +28,12 @@ def _db():
     return str(STATE_DB)
 
 
+def _connect() -> sqlite3.Connection:
+    con = sqlite3.connect(_db(), timeout=_DB_TIMEOUT_S)
+    con.row_factory = sqlite3.Row
+    return con
+
+
 def handle_analytics(handler, parsed):
     qs = parse_qs(parsed.query or "")
     try:
@@ -32,8 +43,7 @@ def handle_analytics(handler, parsed):
     days = max(1, min(days, 365))
     since = time.time() - days * 86400
 
-    con = sqlite3.connect(_db())
-    con.row_factory = sqlite3.Row
+    con = _connect()
     try:
         rows = con.execute(
             """
@@ -50,18 +60,32 @@ def handle_analytics(handler, parsed):
             """,
             (since,),
         ).fetchall()
+        # Grouped by day as well as model: `by_day` was declared and read but
+        # never written, so every series[].cost came back 0.00 regardless of
+        # actual spend. The day column here is what makes that field real.
         cost_rows = con.execute(
             """
-            SELECT model, billing_provider, SUM(COALESCE(estimated_cost_usd,0)) AS cost
+            SELECT model, billing_provider,
+                   strftime('%Y-%m-%d', last_seen, 'unixepoch') AS day,
+                   SUM(COALESCE(estimated_cost_usd,0)) AS cost
             FROM session_model_usage
             WHERE last_seen >= ? AND cost_status IN ('estimated','actual','provider_models_api')
               AND estimated_cost_usd < 1000
               -- per-model sanity: implied $/M-input must be under $50 or the row is a pricing bug
               AND estimated_cost_usd < 50 * (input_tokens + cache_read_tokens) / 1e6 + 1.0
-            GROUP BY model, billing_provider
+            GROUP BY day, model, billing_provider
             """,
             (since,),
         ).fetchall()
+        prev_row = con.execute(
+            """
+            SELECT SUM(COALESCE(estimated_cost_usd,0)) FROM session_model_usage
+            WHERE last_seen >= ? AND last_seen < ?
+              AND cost_status IN ('estimated','actual','provider_models_api')
+              AND estimated_cost_usd < 1000
+            """,
+            (since - days * 86400, since),
+        ).fetchone()
     finally:
         con.close()
 
@@ -102,27 +126,16 @@ def handle_analytics(handler, parsed):
         )
         slot["cost"] += c
         total_cost += c
+        if r["day"]:
+            by_day[r["day"]] += c
 
     models = sorted(by_model.values(), key=lambda x: (-x["cost"], -x["tokens"]))
-    for m in models[:20]:
+    for m in models:
         m["cost"] = round(m["cost"], 2)
         m["share"] = round(100 * m["cost"] / total_cost, 1) if total_cost > 0 else None
 
-    # prior window for delta
-    con = sqlite3.connect(_db())
-    try:
-        row = con.execute(
-            """
-            SELECT SUM(COALESCE(estimated_cost_usd,0)) FROM session_model_usage
-            WHERE last_seen >= ? AND last_seen < ?
-              AND cost_status IN ('estimated','actual','provider_models_api')
-              AND estimated_cost_usd < 1000
-            """,
-            (since - days * 86400, since),
-        ).fetchone()
-        prev_window_cost = float(row[0] or 0.0) if row else 0.0
-    finally:
-        con.close()
+    # prior window for delta (read on the same connection as everything else)
+    prev_window_cost = float(prev_row[0] or 0.0) if prev_row else 0.0
 
     delta_pct = None
     if prev_window_cost > 0 and total_cost > 0:
@@ -130,7 +143,7 @@ def handle_analytics(handler, parsed):
 
     series = [
         {"day": d, "cost": round(by_day.get(d, 0.0), 4), "tokens": toks_by_day.get(d, 0)}
-        for d in sorted(toks_by_day)
+        for d in sorted(set(toks_by_day) | set(by_day))
     ]
 
     return j(
