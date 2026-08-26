@@ -431,10 +431,18 @@ def handle_transcribe(handler):
         with tempfile.NamedTemporaryFile(prefix='webui-stt-', suffix=suffix, delete=False) as tmp:
             temp_path = tmp.name
             tmp.write(file_bytes)
-        # Prefer self-contained Groq STT (no hermes tools dependency);
+        # Run the STT provider registry (Groq/OpenAI-compatible, Deepgram,
+        # Azure, AssemblyAI, ElevenLabs, Google — priority order, Groq first);
         # fall back to the hermes transcription_tools module if present.
+        #
+        # This used to call _stt._transcribe_groq, which the provider-registry
+        # rewrite deleted. The resulting AttributeError was swallowed by the
+        # broad `except Exception` below and returned as a generic 500, so
+        # /api/transcribe — the web UI's push-to-talk AND nyx-mobile's default
+        # `stt: "server"` mode — failed on every request with nothing in the
+        # response to say why.
         import api.stt_chunk as _stt
-        text = _stt._transcribe_groq(temp_path, suffix)
+        text = _stt._transcribe_bytes(file_bytes, suffix)
         if not text:
             try:
                 from tools.transcription_tools import transcribe_audio
