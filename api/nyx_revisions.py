@@ -372,7 +372,14 @@ def _read_rev_content(rev_dir: Path) -> bytes:
 
 
 def _decode_for_diff(data: bytes) -> list[str] | None:
-    """Try utf-8 decode. Return None for binary data."""
+    """Try utf-8 decode. Return None for binary data.
+
+    A NUL byte means binary by every practical definition, and it decodes
+    cleanly as UTF-8 — so without this check an object file or an image would
+    be line-diffed into garbage rather than reported as binary.
+    """
+    if b"\x00" in data:
+        return None
     try:
         return data.decode("utf-8").splitlines(keepends=False)
     except UnicodeDecodeError:
@@ -436,6 +443,60 @@ def diff_revisions(workspace: Path, rel: str, from_rev: str, to_rev: str) -> dic
         "from": from_rev,
         "to": to_rev,
     }
+
+
+def revision_summary(workspace: Path, rel: str) -> dict | None:
+    """Cheap per-file revision facts for the artifact list (design 4a).
+
+    Returns None when the file has never been snapshotted, so a caller can
+    omit the badge entirely rather than render a zero.
+
+    ``unstaged`` means the working file differs from the newest revision — the
+    mockup's "unstaged" chip. ``added``/``removed`` are the diff stat against
+    that newest revision, and are None for a binary file or one too large to
+    diff, so the caller shows the chip without numbers instead of "+0 -0".
+
+    Deliberately does NOT read every revision: only the newest one is opened,
+    because this runs once per artifact in a directory listing.
+    """
+    file_dir = file_rev_dir(workspace, rel)
+    if not file_dir.is_dir():
+        return None
+
+    revs = sorted(
+        (d for d in file_dir.iterdir() if d.is_dir() and _REV_PATTERN.match(d.name)),
+        key=lambda d: _parse_rev_id(d.name) or 0,
+    )
+    if not revs:
+        return None
+
+    newest = revs[-1]
+    out: dict = {"count": len(revs), "latest_rev": newest.name}
+
+    try:
+        target = safe_resolve(workspace, rel)
+        current = target.read_bytes() if target.is_file() else b""
+        stored = _read_rev_content(newest)
+    except (OSError, ValueError):
+        # Unreadable either side — report the count and stop guessing.
+        return out
+
+    out["unstaged"] = current != stored
+    if not out["unstaged"]:
+        out["added"] = 0
+        out["removed"] = 0
+        return out
+
+    if len(current) + len(stored) > 2 * MAX_DIFF_BYTES:
+        return out          # too big to stat; chip renders without numbers
+    a = _decode_for_diff(stored)
+    b = _decode_for_diff(current)
+    if a is None or b is None:
+        return out          # binary; same treatment
+    ud = list(difflib.unified_diff(a, b, lineterm=""))
+    out["added"] = sum(1 for ln in ud if ln.startswith("+") and not ln.startswith("+++"))
+    out["removed"] = sum(1 for ln in ud if ln.startswith("-") and not ln.startswith("---"))
+    return out
 
 
 # ── Revert ──────────────────────────────────────────────────────────────────

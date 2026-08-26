@@ -18272,6 +18272,26 @@ def _handle_artifacts(handler, parsed):
         entries = list_dir(Path(workspace), ".")
         artifacts = [a for e in entries if (a := artifact_from_entry(e))]
         artifacts.sort(key=lambda a: (a["mtime"] or 0), reverse=True)
+        artifacts = artifacts[:60]
+        # Design 4a: revision count, the "unstaged" chip and the +/- diff stat.
+        # Only attached where the file has actually been snapshotted, so the
+        # client can omit the badges rather than render zeros. Done after the
+        # slice so it costs one stat per SHOWN artifact, not per file on disk.
+        try:
+            from api.nyx_revisions import revision_summary
+            ws = Path(workspace)
+            for a in artifacts:
+                rel = a.get("path") or a.get("name")
+                if not rel:
+                    continue
+                try:
+                    summary = revision_summary(ws, rel)
+                except Exception:
+                    summary = None      # never fail the listing over a badge
+                if summary:
+                    a["revisions"] = summary
+        except ImportError:
+            pass
         return j(handler, {"artifacts": artifacts[:60]})
     except Exception as e:
         return bad(handler, _sanitize_error(e), 500)

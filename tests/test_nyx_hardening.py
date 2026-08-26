@@ -679,3 +679,77 @@ def test_analytics_survives_a_garbage_days_param(usage_db):
     handle_analytics(h, urlparse("/api/nyx/analytics?days=abc"))
     assert h.status == 200
     assert h.payload()["days"] == 30
+
+
+# ── revision_summary: the artifact-list badges (design 4a) ─────────────────
+
+
+@pytest.fixture
+def rev_ws(tmp_path):
+    """A workspace with one snapshotted file."""
+    ws = tmp_path / "ws"
+    (ws).mkdir()
+    return ws
+
+
+def test_revision_summary_none_before_any_snapshot(rev_ws):
+    """No snapshot means no badge at all — the client must not show a zero."""
+    from api.nyx_revisions import revision_summary
+    (rev_ws / "a.py").write_text("x = 1\n")
+    assert revision_summary(rev_ws, "a.py") is None
+
+
+def test_revision_summary_counts_and_reports_clean(rev_ws):
+    from api.nyx_revisions import revision_summary, snapshot_revision
+    (rev_ws / "a.py").write_text("x = 1\n")
+    snapshot_revision(rev_ws, "a.py", "first")
+    s = revision_summary(rev_ws, "a.py")
+    assert s["count"] == 1
+    assert s["unstaged"] is False
+    assert s["added"] == 0 and s["removed"] == 0
+
+
+def test_revision_summary_detects_unstaged_edits_with_a_stat(rev_ws):
+    from api.nyx_revisions import revision_summary, snapshot_revision
+    f = rev_ws / "a.py"
+    f.write_text("a\nb\nc\n")
+    snapshot_revision(rev_ws, "a.py", "first")
+    f.write_text("a\nB\nc\nd\n")     # one line changed, one added
+    s = revision_summary(rev_ws, "a.py")
+    assert s["unstaged"] is True
+    assert s["added"] == 2 and s["removed"] == 1
+
+
+def test_revision_summary_counts_multiple_revisions(rev_ws):
+    from api.nyx_revisions import revision_summary, snapshot_revision
+    f = rev_ws / "a.py"
+    for i in range(3):
+        f.write_text(f"v{i}\n")
+        snapshot_revision(rev_ws, "a.py", f"r{i}")
+    s = revision_summary(rev_ws, "a.py")
+    assert s["count"] == 3
+    assert s["latest_rev"].startswith("r")
+
+
+def test_revision_summary_binary_reports_no_stat(rev_ws):
+    """A binary file gets the chip but no numbers, never a fabricated +0/-0."""
+    from api.nyx_revisions import revision_summary, snapshot_revision
+    f = rev_ws / "blob.bin"
+    f.write_bytes(b"\x00\x01\x02")
+    snapshot_revision(rev_ws, "blob.bin", "first")
+    f.write_bytes(b"\x00\x01\x03\x04")
+    s = revision_summary(rev_ws, "blob.bin")
+    assert s["unstaged"] is True
+    assert "added" not in s and "removed" not in s
+
+
+def test_revision_summary_survives_a_deleted_working_file(rev_ws):
+    """The file can vanish after being snapshotted; the summary must not raise."""
+    from api.nyx_revisions import revision_summary, snapshot_revision
+    f = rev_ws / "a.py"
+    f.write_text("x\n")
+    snapshot_revision(rev_ws, "a.py", "first")
+    f.unlink()
+    s = revision_summary(rev_ws, "a.py")
+    assert s["count"] == 1
+    assert s.get("unstaged") is True
