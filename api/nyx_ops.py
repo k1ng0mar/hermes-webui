@@ -4,16 +4,23 @@ These wrap live Hermes CLI / profile stores. No invented numbers.
 """
 from __future__ import annotations
 
+import calendar
 import json
+import logging
 import os
+import re
 import sqlite3
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 from api.helpers import bad, j
+from api.nyx_store import atomic_write_json, atomic_write_text, load_json
+
+logger = logging.getLogger(__name__)
 
 QUOTA_PATH = Path(os.environ.get("NYX_QUOTA_JSON", "/home/ubuntu/llm-router/quota.json"))
 ROUTER_YAML = Path(os.environ.get("NYX_ROUTER_YAML", "/home/ubuntu/llm-router/router.yaml"))
@@ -172,37 +179,36 @@ def refresh_quota(fresh: bool = True) -> dict:
     snap, cards = _snapshots_to_quota(snaps, now)
 
     # Keep only manual overlays that resetwatch did not cover.
-    if QUOTA_PATH.is_file():
-        try:
-            existing = json.loads(QUOTA_PATH.read_text()) or {}
-        except Exception:
-            existing = {}
-        if isinstance(existing, dict):
-            for k, v in existing.items():
-                if k.startswith("_") or k in snap:
-                    continue
-                if isinstance(v, dict) and v.get("source") == "manual" and v.get("percent_left") is not None:
-                    snap[k] = v
+    for k, v in load_json(QUOTA_PATH, {}).items():
+        if k.startswith("_") or k in snap:
+            continue
+        if isinstance(v, dict) and v.get("source") == "manual" and v.get("percent_left") is not None:
+            snap[k] = v
 
-    QUOTA_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload = dict(snap)
     payload["_updated_at"] = now
     payload["_source"] = "hermes-resetwatch"
     if notes:
         payload["_errors"] = notes
     payload["_cards"] = cards
-    QUOTA_PATH.write_text(json.dumps(payload, indent=2) + "\n")
+    atomic_write_json(QUOTA_PATH, payload)
 
+    # router.yaml holds the only copy of every provider API key. This rewrite
+    # only ever fills in an empty `quota_file:`, but a truncate-then-write here
+    # meant a crash mid-write destroyed the keys with no backup. Go through the
+    # atomic writer (temp + fsync + rename, ownership/mode preserved) and only
+    # after re-reading and confirming the substitution actually changed
+    # something, so a no-op never rewrites the file at all.
     try:
         text = ROUTER_YAML.read_text()
         if 'quota_file: ""' in text or "quota_file: ''" in text:
-            ROUTER_YAML.write_text(
-                text.replace('quota_file: ""', f'quota_file: "{QUOTA_PATH}"').replace(
-                    "quota_file: ''", f'quota_file: "{QUOTA_PATH}"'
-                )
-            )
+            updated = text.replace(
+                'quota_file: ""', f'quota_file: "{QUOTA_PATH}"'
+            ).replace("quota_file: ''", f'quota_file: "{QUOTA_PATH}"')
+            if updated != text:
+                atomic_write_text(ROUTER_YAML, updated)
     except Exception:
-        pass
+        logger.warning("Could not point router.yaml at the quota file", exc_info=True)
 
     return {
         "path": str(QUOTA_PATH),
@@ -217,12 +223,9 @@ def refresh_quota(fresh: bool = True) -> dict:
 def read_quota() -> dict:
     if not QUOTA_PATH.is_file():
         return {"path": str(QUOTA_PATH), "providers": {}, "empty": True, "source": "resetwatch"}
-    try:
-        raw = json.loads(QUOTA_PATH.read_text())
-    except Exception as e:
-        return {"path": str(QUOTA_PATH), "providers": {}, "error": str(e)}
+    raw = load_json(QUOTA_PATH, {})
     providers = {}
-    if isinstance(raw, dict):
+    if raw:
         for k, v in raw.items():
             if k.startswith("_"):
                 continue
@@ -245,31 +248,59 @@ def read_quota() -> dict:
     return {
         "path": str(QUOTA_PATH),
         "providers": providers,
-        "cards": raw.get("_cards") if isinstance(raw, dict) else [],
-        "updated_at": raw.get("_updated_at") if isinstance(raw, dict) else None,
-        "source": raw.get("_source") if isinstance(raw, dict) else None,
-        "errors": raw.get("_errors") if isinstance(raw, dict) else [],
+        "cards": raw.get("_cards") or [],
+        "updated_at": raw.get("_updated_at"),
+        "source": raw.get("_source"),
+        "errors": raw.get("_errors") or [],
     }
 
 
 def _quota_age_s() -> float:
     if not QUOTA_PATH.is_file():
         return 1e9
-    try:
-        raw = json.loads(QUOTA_PATH.read_text())
-        ts = str((raw or {}).get("_updated_at") or "")
-        if not ts:
+    raw = load_json(QUOTA_PATH, {})
+    ts = str(raw.get("_updated_at") or "")
+    if not ts:
+        try:
             return time.time() - QUOTA_PATH.stat().st_mtime
-        # 2026-08-22T17:42:18Z
+        except OSError:
+            return 1e9
+    try:
+        # 2026-08-22T17:42:18Z — the stamp is UTC, so it must be converted with
+        # calendar.timegm. The previous `mktime(t) + time.timezone` read it as
+        # local time and corrected by the *standard* offset, so during DST the
+        # age was off by an hour — enough to call a fresh file stale (or a stale
+        # one fresh) right around the 5-minute boundary.
         t = time.strptime(ts.replace("Z", ""), "%Y-%m-%dT%H:%M:%S")
-        return time.time() - time.mktime(t) + time.timezone
-    except Exception:
+        return time.time() - calendar.timegm(t)
+    except (ValueError, OverflowError):
         return 1e9
+
+
+# Serializes every quota refresh AND every manual-overlay write. Two guarantees:
+#   * one resetwatch probe at a time — a plain GET used to fan out an unbounded
+#     number of 55s `python3 probe.py` subprocesses (one per concurrent stale
+#     request), all racing to write quota.json;
+#   * read-modify-write of the manual overlays can't interleave and lose an entry.
+_quota_lock = threading.Lock()
+
+
+def _refresh_quota_deduped(fresh: bool) -> None:
+    """Refresh at most once per staleness window, no matter how many callers.
+
+    Latecomers that arrive while a probe is in flight block on the lock, then
+    re-check the age and return immediately — they get the fresh result the
+    winner just wrote instead of launching a probe of their own.
+    """
+    with _quota_lock:
+        if _quota_age_s() <= QUOTA_STALE_S:
+            return
+        refresh_quota(fresh=fresh)
 
 
 def handle_quota_get(handler):
     if _quota_age_s() > QUOTA_STALE_S:
-        refresh_quota(fresh=False)
+        _refresh_quota_deduped(fresh=False)
     return j(handler, read_quota())
 
 
@@ -277,32 +308,32 @@ def handle_quota_refresh(handler, body=None):
     body = body or {}
     if body.get("providers"):
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        current = {}
-        if QUOTA_PATH.is_file():
-            try:
-                current = json.loads(QUOTA_PATH.read_text()) or {}
-            except Exception:
-                current = {}
-        if not isinstance(current, dict):
-            current = {}
-        for name, rec in (body.get("providers") or {}).items():
-            if not name:
-                continue
-            if isinstance(rec, (int, float)):
-                rec = {"percent_left": float(rec)}
-            if not isinstance(rec, dict):
-                continue
-            current[str(name)] = {
-                "percent_left": rec.get("percent_left"),
-                "reset_at": rec.get("reset_at"),
-                "note": rec.get("note") or "manual",
-                "source": "manual",
-                "updated_at": now,
-            }
-        current["_updated_at"] = now
-        QUOTA_PATH.write_text(json.dumps(current, indent=2) + "\n")
+        with _quota_lock:
+            _apply_manual_overlays(body.get("providers") or {}, now)
         return j(handler, read_quota())
-    return j(handler, refresh_quota(fresh=bool(body.get("fresh", True))))
+    with _quota_lock:
+        return j(handler, refresh_quota(fresh=bool(body.get("fresh", True))))
+
+
+def _apply_manual_overlays(providers: dict, now: str) -> None:
+    """Merge caller-supplied manual quota figures. Caller holds _quota_lock."""
+    current = load_json(QUOTA_PATH, {})
+    for name, rec in (providers or {}).items():
+        if not name:
+            continue
+        if isinstance(rec, (int, float)):
+            rec = {"percent_left": float(rec)}
+        if not isinstance(rec, dict):
+            continue
+        current[str(name)] = {
+            "percent_left": rec.get("percent_left"),
+            "reset_at": rec.get("reset_at"),
+            "note": rec.get("note") or "manual",
+            "source": "manual",
+            "updated_at": now,
+        }
+    current["_updated_at"] = now
+    atomic_write_json(QUOTA_PATH, current)
 
 
 def handle_skills_hub(handler, parsed):
@@ -321,10 +352,33 @@ def handle_skills_hub(handler, parsed):
     return j(handler, {"query": q, "results": items, "ok": code == 0, "error": err.strip()[:400] if code else ""})
 
 
+# Install identifiers are passed as argv to the Hermes CLI. There is no shell,
+# so no shell injection — but a value starting with "-" is parsed by the CLI as
+# a FLAG rather than a package name, which turns "install this skill" into
+# "install with these options" on an endpoint that already passes --yes.
+# Restrict to the shapes a real skill/MCP identifier takes (name,
+# scope/name, owner/repo, or a URL) and reject anything leading with a dash.
+_IDENT_RE = re.compile(r"^(?:https?://[^\s]{1,400}|[A-Za-z0-9][A-Za-z0-9._@/+-]{0,200})$")
+
+
+def _validate_identifier(value: str, field: str = "identifier") -> str:
+    value = str(value or "").strip()
+    if not value:
+        raise ValueError(f"{field} required")
+    if value.startswith("-"):
+        raise ValueError(f"{field} may not start with '-'")
+    if not _IDENT_RE.match(value):
+        raise ValueError(f"invalid {field}")
+    return value
+
+
 def handle_skills_install(handler, body):
-    ident = str(body.get("identifier") or body.get("name") or "").strip()
-    if not ident:
-        return bad(handler, "identifier required")
+    try:
+        ident = _validate_identifier(
+            (body or {}).get("identifier") or (body or {}).get("name") or ""
+        )
+    except ValueError as e:
+        return bad(handler, str(e))
     code, out, err = _run([HERMES, "skills", "install", ident, "--yes"], timeout=120)
     return j(handler, {"ok": code == 0, "identifier": ident, "output": (out or err)[-2000:]})
 
@@ -346,11 +400,23 @@ def handle_skills_toggle(handler, body):
     return j(handler, {"ok": code == 0, "name": name, "enabled": enabled, "output": (out or err)[-800:]})
 
 
+def _ensure_agent_on_path() -> None:
+    """Put the hermes-agent tree on sys.path exactly once.
+
+    The unguarded `sys.path.insert(0, ...)` this replaces ran on EVERY request
+    to the calling endpoints, so sys.path grew without bound for the life of the
+    process and every import in the server paid a longer linear scan.
+    """
+    import sys
+
+    agent_dir = str(Path.home() / ".hermes" / "hermes-agent")
+    if agent_dir not in sys.path:
+        sys.path.insert(0, agent_dir)
+
+
 def handle_mcp_catalog(handler):
     try:
-        import sys
-
-        sys.path.insert(0, str(Path.home() / ".hermes" / "hermes-agent"))
+        _ensure_agent_on_path()
         from hermes_cli.mcp_catalog import list_catalog  # type: ignore
 
         entries = []
@@ -378,9 +444,10 @@ def handle_mcp_catalog(handler):
 
 
 def handle_mcp_install(handler, body):
-    name = str(body.get("name") or "").strip()
-    if not name:
-        return bad(handler, "name required")
+    try:
+        name = _validate_identifier((body or {}).get("name") or "", "name")
+    except ValueError as e:
+        return bad(handler, str(e))
     code, out, err = _run([HERMES, "mcp", "install", name], timeout=90)
     return j(handler, {"ok": code == 0, "name": name, "output": (out or err)[-2000:]})
 
@@ -413,17 +480,32 @@ def handle_curator_post(handler, body):
         return bad(handler, f"action must be one of {sorted(allowed)}")
     args = [HERMES, "curator", action]
     if action in {"pin", "unpin", "archive", "restore", "adopt"}:
-        if not name:
-            return bad(handler, "name required")
+        try:
+            name = _validate_identifier(name, "name")
+        except ValueError as e:
+            return bad(handler, str(e))
         args.append(name)
     code, out, err = _run(args, timeout=180)
     return j(handler, {"ok": code == 0, "action": action, "output": (out or err)[-2000:]})
 
 
+# state.db is written concurrently by the agent (GoalManager, the heartbeat
+# scheduler). sqlite's default 5s busy timeout turns any contended read into a
+# 500, so give writers room to finish; isolation_level=None puts us in explicit
+# transaction control, which the read-modify-write helpers below need.
+_STATE_DB_TIMEOUT_S = 15.0
+
+
+def _state_db() -> sqlite3.Connection:
+    return sqlite3.connect(
+        str(STATE_DB), timeout=_STATE_DB_TIMEOUT_S, isolation_level=None
+    )
+
+
 def _state_rows(prefix: str) -> list[dict]:
     if not STATE_DB.is_file():
         return []
-    con = sqlite3.connect(str(STATE_DB))
+    con = _state_db()
     try:
         rows = con.execute("SELECT key, value FROM state_meta WHERE key LIKE ?", (prefix + "%",)).fetchall()
     finally:
@@ -452,11 +534,18 @@ def handle_goal_action(handler, body):
     action = str((body or {}).get("action") or "").strip().lower()
     if not sid:
         return bad(handler, "session_id required")
+    if action not in ("pause", "resume", "clear"):
+        return bad(handler, "action must be pause|resume|clear")
     key = f"goal:{sid}"
-    con = sqlite3.connect(str(STATE_DB))
+    con = _state_db()
     try:
+        # BEGIN IMMEDIATE takes the write lock up front, so the agent's own
+        # GoalManager cannot land an update between this SELECT and the UPDATE
+        # below and have it silently discarded.
+        con.execute("BEGIN IMMEDIATE")
         row = con.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
         if not row:
+            con.execute("ROLLBACK")
             return bad(handler, "no goal on that session", 404)
         data = json.loads(row[0])
         if action == "pause":
@@ -469,12 +558,16 @@ def handle_goal_action(handler, body):
             data["paused_reason"] = None
             data["waiting_until"] = 0.0
             data["turns_used"] = 0
-        elif action == "clear":
-            data["status"] = "cleared"
         else:
-            return bad(handler, "action must be pause|resume|clear")
+            data["status"] = "cleared"
         con.execute("UPDATE state_meta SET value = ? WHERE key = ?", (json.dumps(data), key))
-        con.commit()
+        con.execute("COMMIT")
+    except BaseException:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
     finally:
         con.close()
     return j(handler, {"ok": True, "session_id": sid, "status": data["status"]})
@@ -484,9 +577,25 @@ def handle_goal_create(handler, body):
     """Attach a goal to a session — the /goal contract: goal + session_id."""
     sid = str((body or {}).get("session_id") or "").strip()
     goal = str((body or {}).get("goal") or "").strip()
-    max_turns = int((body or {}).get("max_turns") or 1000)
     if not sid or not goal:
         return bad(handler, "session_id and goal required")
+    # A bare int() on request input raised ValueError straight past the handler
+    # into the server's catch-all, surfacing as an opaque 500 instead of a 400.
+    # Note the default is applied ONLY when the field is absent: writing
+    # `int(x or 1000)` lets every falsy value — 0, "", {}, [] — short-circuit
+    # past the range check and silently become 1000.
+    raw_max = (body or {}).get("max_turns")
+    if raw_max is None or raw_max == "":
+        max_turns = 1000
+    elif isinstance(raw_max, bool) or not isinstance(raw_max, (int, float, str)):
+        return bad(handler, "max_turns must be an integer")
+    else:
+        try:
+            max_turns = int(raw_max)
+        except (TypeError, ValueError):
+            return bad(handler, "max_turns must be an integer")
+    if not 1 <= max_turns <= 100000:
+        return bad(handler, "max_turns must be between 1 and 100000")
     rec = {
         "goal": goal,
         "status": "active",
@@ -496,13 +605,12 @@ def handle_goal_create(handler, body):
         "last_turn_at": time.time(),
         "created_by": "mobile",
     }
-    con = sqlite3.connect(str(STATE_DB))
+    con = _state_db()
     try:
         con.execute(
             "INSERT OR REPLACE INTO state_meta(key, value) VALUES (?, ?)",
             (f"goal:{sid}", json.dumps(rec)),
         )
-        con.commit()
     finally:
         con.close()
     return j(handler, {"ok": True, "goal": {**rec, "session_id": sid}})
@@ -522,23 +630,32 @@ def handle_heartbeat_set(handler, body):
     if not sid:
         return bad(handler, "session_id required")
     if action == "clear":
-        con = sqlite3.connect(str(STATE_DB))
+        con = _state_db()
         try:
             con.execute("DELETE FROM state_meta WHERE key = ?", (f"heartbeat:{sid}",))
-            con.commit()
         finally:
             con.close()
         return j(handler, {"ok": True, "cleared": sid})
     if action in {"pause", "resume"}:
-        con = sqlite3.connect(str(STATE_DB))
+        con = _state_db()
         try:
+            # Same lost-update hazard as goals: the heartbeat scheduler updates
+            # last_fired_at / fire_count on this row while the phone toggles it.
+            con.execute("BEGIN IMMEDIATE")
             row = con.execute("SELECT value FROM state_meta WHERE key = ?", (f"heartbeat:{sid}",)).fetchone()
             if not row:
+                con.execute("ROLLBACK")
                 return bad(handler, "no heartbeat on that session", 404)
             data = json.loads(row[0])
             data["status"] = "paused" if action == "pause" else "active"
             con.execute("UPDATE state_meta SET value = ? WHERE key = ?", (json.dumps(data), f"heartbeat:{sid}"))
-            con.commit()
+            con.execute("COMMIT")
+        except BaseException:
+            try:
+                con.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
         finally:
             con.close()
         return j(handler, {"ok": True, "session_id": sid, "status": data["status"]})
@@ -547,9 +664,7 @@ def handle_heartbeat_set(handler, body):
     # parse interval
     seconds = 600
     try:
-        import sys
-
-        sys.path.insert(0, str(Path.home() / ".hermes" / "hermes-agent"))
+        _ensure_agent_on_path()
         from hermes_cli.heartbeat import parse_interval  # type: ignore
 
         parsed = parse_interval(interval)
@@ -565,13 +680,12 @@ def handle_heartbeat_set(handler, body):
         "last_fired_at": 0.0,
         "fire_count": 0,
     }
-    con = sqlite3.connect(str(STATE_DB))
+    con = _state_db()
     try:
         con.execute(
             "INSERT OR REPLACE INTO state_meta(key, value) VALUES (?, ?)",
             (f"heartbeat:{sid}", json.dumps(rec)),
         )
-        con.commit()
     finally:
         con.close()
     return j(handler, {"ok": True, "heartbeat": {**rec, "session_id": sid}})

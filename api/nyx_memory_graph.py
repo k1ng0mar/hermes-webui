@@ -57,6 +57,11 @@ _LOCK = threading.Lock()
 _INFLIGHT: set[tuple] = set()
 _LAST: dict | None = None
 
+# Ceiling on concurrent builds. Each one is a CPU-bound subprocess (numpy k-NN
+# + Louvain + force layout) with a 180s timeout, on a host that is also running
+# the agent — two at a time is already generous.
+_MAX_INFLIGHT = 2
+
 # Defaults tuned against the live store (2358 memories, 803 stored edges).
 # k=8/min_sim=0.62 under mutual k-NN gives ~5.2k semantic edges, degree spread
 # 1..14 (median 4), ~106 orphans and ~160 communities — a connected core with a
@@ -629,8 +634,14 @@ def handle_graph(handler, parsed):
             payload["building"] = False
             return j(handler, payload)
 
+        # _INFLIGHT dedupes per parameter set, but every DISTINCT set used to
+        # get its own thread and its own ~40s (up to 180s) subprocess, with
+        # nothing bounding how many ran at once — a client sweeping k/min_sim,
+        # or just a poll loop that varies params, could pin the box. Cap the
+        # concurrent builds; refused callers still get the stale graph and the
+        # next poll starts a build once a slot frees.
         building = key in _INFLIGHT
-        if not building:
+        if not building and len(_INFLIGHT) < _MAX_INFLIGHT:
             _INFLIGHT.add(key)
             threading.Thread(
                 target=_build_async, args=(key, p), daemon=True,

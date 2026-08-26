@@ -16,6 +16,7 @@ import urllib.request
 from pathlib import Path
 
 from api.helpers import bad, j
+from api.nyx_store import atomic_write_json, load_json
 
 logger = logging.getLogger(__name__)
 
@@ -24,17 +25,17 @@ _lock = threading.Lock()
 
 
 def _load() -> dict:
-    if not _STORE.is_file():
-        return {"devices": [], "webhook": ""}
-    try:
-        return json.loads(_STORE.read_text())
-    except Exception:
-        return {"devices": [], "webhook": ""}
+    """Read the push store. A corrupt file is quarantined, never silently reset:
+    losing the device registrations means the phone stops getting notifications
+    with nothing in the log to explain it."""
+    data = load_json(_STORE, {"devices": [], "webhook": ""})
+    if not isinstance(data.get("devices"), list):
+        data["devices"] = []
+    return data
 
 
 def _save(data: dict) -> None:
-    _STORE.parent.mkdir(parents=True, exist_ok=True)
-    _STORE.write_text(json.dumps(data, indent=2))
+    atomic_write_json(_STORE, data)
 
 
 def notify(kind: str, title: str, body: str, session_id: str | None = None) -> None:

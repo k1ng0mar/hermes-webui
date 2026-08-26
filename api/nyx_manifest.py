@@ -7,12 +7,12 @@ POST /api/nyx/manifest/reject
 """
 from __future__ import annotations
 
-import json
 import threading
 import time
 from pathlib import Path
 
 from api.helpers import bad, j
+from api.nyx_store import atomic_write_json, load_json
 
 _STORE = Path.home() / ".hermes" / "webui" / "nyx-manifest.json"
 _lock = threading.Lock()
@@ -41,20 +41,14 @@ DEFAULT = {
 
 
 def _load() -> dict:
-    if not _STORE.is_file():
-        return {"applied": dict(DEFAULT), "pending": None}
-    try:
-        data = json.loads(_STORE.read_text())
-    except Exception:
-        return {"applied": dict(DEFAULT), "pending": None}
+    data = load_json(_STORE, {"applied": dict(DEFAULT), "pending": None})
     if not isinstance(data.get("applied"), dict):
         data["applied"] = dict(DEFAULT)
     return data
 
 
 def _save(data: dict) -> None:
-    _STORE.parent.mkdir(parents=True, exist_ok=True)
-    _STORE.write_text(json.dumps(data, indent=2))
+    atomic_write_json(_STORE, data)
 
 
 def sanitize(raw: dict) -> dict:

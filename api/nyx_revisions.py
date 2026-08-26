@@ -55,11 +55,13 @@ import difflib
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from urllib.parse import parse_qs, unquote
 
 from api.helpers import bad, j, read_body, safe_resolve
+from api.nyx_store import atomic_write_bytes, atomic_write_text
 
 # Configurable caps. Keep the working set small — old revisions fall
 # off the end on a FIFO basis.
@@ -69,6 +71,27 @@ MAX_DIFF_BYTES = 5 * 1024 * 1024   # 5 MB diff cap (matches MAX_PREVIEW_SIZE)
 MAX_REVISION_BYTES = 5 * 1024 * 1024  # refuse to snapshot huge files
 
 _REV_PATTERN = re.compile(r"^r(\d+)$")
+
+# Snapshot/revert/prune do read-modify-write on a shared revisions directory.
+# Without this, two concurrent snapshots of the same file both resolve the same
+# `_next_rev_id`, both mkdir(exist_ok=True), and the second silently overwrites
+# the first one's content — a lost revision with no error anywhere.
+_revision_lock = threading.Lock()
+
+
+def _validate_rev_id(rev: str) -> str:
+    """Reject anything that is not a literal rN revision id.
+
+    `rev` arrives straight from the request body/query and is joined onto the
+    revisions directory. Unvalidated, `../../..` walks out of the revisions root
+    — and on the revert path the content found out there gets written into the
+    user's workspace file. _REV_PATTERN existed but was only ever applied to
+    directory names already read off disk, never to caller input.
+    """
+    rev = str(rev or "").strip()
+    if not _REV_PATTERN.match(rev):
+        raise ValueError(f"invalid revision id: {rev!r}")
+    return rev
 
 
 # ── Path encoding ───────────────────────────────────────────────────────────
@@ -186,8 +209,8 @@ def _read_meta(rev_dir: Path) -> dict:
 
 
 def _write_meta(rev_dir: Path, meta: dict) -> None:
-    (rev_dir / "meta.json").write_text(
-        json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8"
+    atomic_write_text(
+        rev_dir / "meta.json", json.dumps(meta, indent=2, sort_keys=True)
     )
 
 
@@ -235,43 +258,47 @@ def snapshot_revision(workspace: Path, rel: str, message: str = "",
 
     file_dir = file_rev_dir(workspace, rel)
 
-    # Idempotency: if the most recent rev has identical content, reuse it.
-    existing = _existing_rev_for_content(file_dir, content)
-    if existing is not None:
-        meta = _read_meta(existing)
-        return {
-            "rev": existing.name,
-            "mtime": meta.get("mtime", int(existing.stat().st_mtime * 1000)),
-            "size": meta.get("size", len(content)),
-            "created": False,
+    # Everything from here down is read-modify-write on file_dir: the dedup
+    # scan, the _next_rev_id allocation and the FIFO prune all have to see a
+    # consistent directory or concurrent snapshots clobber each other.
+    with _revision_lock:
+        # Idempotency: if the most recent rev has identical content, reuse it.
+        existing = _existing_rev_for_content(file_dir, content)
+        if existing is not None:
+            meta = _read_meta(existing)
+            return {
+                "rev": existing.name,
+                "mtime": meta.get("mtime", int(existing.stat().st_mtime * 1000)),
+                "size": meta.get("size", len(content)),
+                "created": False,
+            }
+
+        rev_id = _next_rev_id(file_dir)
+        rev_dir = file_dir / rev_id
+        rev_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write_bytes(rev_dir / "content", content)
+
+        # Find parent rev_id (the previous newest).
+        parent = ""
+        n = _parse_rev_id(rev_id)
+        if n is not None and n > 0:
+            parent = f"r{n - 1}"
+            if not (file_dir / parent).exists():
+                parent = ""
+
+        mtime_ms = int(time.time() * 1000)
+        meta = {
+            "rev": rev_id,
+            "mtime": mtime_ms,
+            "size": len(content),
+            "parent": parent,
+            "message": message[:500] if message else "",
+            "author": author[:100] if author else "nyx",
         }
+        _write_meta(rev_dir, meta)
 
-    rev_id = _next_rev_id(file_dir)
-    rev_dir = file_dir / rev_id
-    rev_dir.mkdir(parents=True, exist_ok=True)
-    (rev_dir / "content").write_bytes(content)
-
-    # Find parent rev_id (the previous newest).
-    parent = ""
-    n = _parse_rev_id(rev_id)
-    if n is not None and n > 0:
-        parent = f"r{n - 1}"
-        if not (file_dir / parent).exists():
-            parent = ""
-
-    mtime_ms = int(time.time() * 1000)
-    meta = {
-        "rev": rev_id,
-        "mtime": mtime_ms,
-        "size": len(content),
-        "parent": parent,
-        "message": message[:500] if message else "",
-        "author": author[:100] if author else "nyx",
-    }
-    _write_meta(rev_dir, meta)
-
-    # FIFO prune: keep at most MAX_REVISIONS_KEPT.
-    _prune_old_revisions(file_dir)
+        # FIFO prune: keep at most MAX_REVISIONS_KEPT.
+        _prune_old_revisions(file_dir)
 
     return {
         "rev": rev_id,
@@ -367,7 +394,7 @@ def diff_revisions(workspace: Path, rel: str, from_rev: str, to_rev: str) -> dic
     def fetch(rev: str) -> bytes:
         if rev in ("head", "working", "current"):
             return target.read_bytes()
-        rev_dir = file_dir / rev
+        rev_dir = file_dir / _validate_rev_id(rev)
         if not rev_dir.exists():
             raise FileNotFoundError(f"revision {rev!r} not found")
         return _read_rev_content(rev_dir)
@@ -422,6 +449,7 @@ def revert_to_revision(workspace: Path, rel: str, rev: str) -> dict:
     the revert is itself reversible. Returns {rev, mtime, size,
     restored_from}.
     """
+    rev = _validate_rev_id(rev)
     target = safe_resolve(workspace, rel)
     if not target.exists() or not target.is_file():
         raise FileNotFoundError(rel)
@@ -436,10 +464,14 @@ def revert_to_revision(workspace: Path, rel: str, rev: str) -> dict:
     pre_content = target.read_bytes()
     rev_content = _read_rev_content(rev_dir)
     if pre_content != rev_content:
+        # NB: snapshot_revision takes _revision_lock itself, so it must be
+        # called before we hold it — the lock is not reentrant.
         snapshot_revision(workspace, rel, message=f"pre-revert to {rev}", author="nyx")
 
-    # Now overwrite the working file.
-    target.write_bytes(rev_content)
+    # Now overwrite the working file. This is the user's real source file, so
+    # it goes through temp+fsync+rename: a crash mid-revert used to truncate
+    # the very file the revision history exists to protect.
+    atomic_write_bytes(target, rev_content)
 
     return {
         "rev": rev,

@@ -201,7 +201,15 @@ def _call(op: str, *args, timeout: float = 25.0) -> dict:
 
 
 def handle_state(handler):
-    return j(handler, dict(_state))
+    # _state["active"] is set True by the worker and only reset when its loop
+    # exits cleanly. If the thread dies abruptly (Chrome crash, killed
+    # subprocess) the flag stays True forever and the client is told a browser
+    # is live that isn't. The thread's own liveness is the source of truth.
+    state = dict(_state)
+    if state.get("active") and not (_thread and _thread.is_alive()):
+        state["active"] = False
+        state["error"] = _err or "browser worker is not running"
+    return j(handler, state)
 
 
 def handle_frame(handler):

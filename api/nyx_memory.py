@@ -6,6 +6,7 @@ GET /api/nyx/memory?backend=native|galaxymem
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -95,7 +96,17 @@ def _mems_to_payload(mems: list) -> dict:
     return {"nodes": mems, "clusters": list(clusters.values()), "backend": "galaxymem"}
 
 
+# Importing the plugin into the WebUI process pulls third-party code (lance,
+# pyarrow, pandas) into the server: a segfault or a leak in that stack takes the
+# backend down with it, and the sys.path insert is process-global and permanent.
+# The one-shot subprocess is isolated and only ~200ms slower on a cold read, so
+# it is the default; set NYX_GALAXYMEM_INPROCESS=1 to opt back in.
+_INPROCESS_OK = os.environ.get("NYX_GALAXYMEM_INPROCESS", "").strip().lower() in ("1", "true", "yes")
+
+
 def _try_inprocess() -> list | None:
+    if not _INPROCESS_OK:
+        return None
     try:
         if str(_PLUGIN) not in sys.path and _PLUGIN.exists():
             sys.path.insert(0, str(_PLUGIN))
@@ -153,7 +164,15 @@ def _try_subprocess() -> list:
             last_err = str(e)
             continue
         if proc.returncode == 0 and proc.stdout.strip():
-            return json.loads(proc.stdout)
+            try:
+                data = json.loads(proc.stdout)
+            except json.JSONDecodeError as e:
+                last_err = f"reader json: {e}"
+                continue
+            if not isinstance(data, list):
+                last_err = "reader did not return an array"
+                continue
+            return data
         last_err = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()[:400]
     raise RuntimeError(last_err)
 
