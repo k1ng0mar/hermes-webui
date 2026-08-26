@@ -13418,6 +13418,10 @@ def handle_get(handler, parsed) -> bool:
         from api.nyx_manifest import handle_get
         return handle_get(handler)
 
+    if parsed.path == "/api/nyx/plugins/search":
+        from api.nyx_plugins import handle_plugin_search
+        return handle_plugin_search(handler, parsed)
+
     if parsed.path == "/api/nyx/memory/backends":
         from api.nyx_memory import handle_backends
         return handle_backends(handler)
@@ -16623,6 +16627,15 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/nyx/memory/forget":
         from api.nyx_memory import handle_forget
         return handle_forget(handler, body)
+    if parsed.path == "/api/nyx/plugins/enable":
+        from api.nyx_plugins import handle_plugin_enable
+        return handle_plugin_enable(handler, body)
+    if parsed.path == "/api/nyx/plugins/disable":
+        from api.nyx_plugins import handle_plugin_disable
+        return handle_plugin_disable(handler, body)
+    if parsed.path == "/api/nyx/plugins/install":
+        from api.nyx_plugins import handle_plugin_install
+        return handle_plugin_install(handler, body)
     if parsed.path == "/api/nyx/revisions/snapshot":
         from api.nyx_revisions import handle_revisions_snapshot
         return handle_revisions_snapshot(handler, body)

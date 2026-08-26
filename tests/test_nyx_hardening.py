@@ -854,3 +854,125 @@ def test_create_profile_soul_content_is_optional():
     import api.profiles as prof
     sig = inspect.signature(prof.create_profile_api)
     assert sig.parameters["soul_content"].default is None
+
+
+# ── plugin write endpoints: argv safety and CLI contract ───────────────────
+
+
+def test_plugin_name_rejects_flag_injection():
+    """A leading '-' would be parsed as an option by the CLI."""
+    from api.nyx_plugins import _validated_name
+    for bad_name in ["-rf", "--force", "-"]:
+        v, err = _validated_name({"name": bad_name})
+        assert v is None and err
+
+
+def test_plugin_name_rejects_shell_metacharacters():
+    from api.nyx_plugins import _validated_name
+    for bad_name in ["a;rm -rf /", "a b", "a|b", "a$(id)", "a`id`", "a&b", "a>b"]:
+        v, err = _validated_name({"name": bad_name})
+        assert v is None, f"{bad_name!r} should be rejected"
+
+
+def test_plugin_name_accepts_real_names():
+    from api.nyx_plugins import _validated_name
+    for good in ["galaxymem", "hermes-peer", "browser/browser_use", "a2a-platform", "time-gap"]:
+        v, err = _validated_name({"name": good})
+        assert v == good and err is None
+
+
+def test_plugin_name_requires_a_string_body():
+    from api.nyx_plugins import _validated_name
+    assert _validated_name("nope")[0] is None
+    assert _validated_name({})[0] is None
+    assert _validated_name({"name": 7})[0] is None
+    assert _validated_name({"name": "   "})[0] is None
+
+
+def test_install_identifier_accepts_https_url_and_shorthand():
+    from api.nyx_plugins import _validated_identifier
+    ok = [
+        "https://github.com/anpicasso/hermes-plugin-chrome-profiles",
+        "anpicasso/hermes-plugin-chrome-profiles",
+        "chrome-profiles",
+    ]
+    for v in ok:
+        got, err = _validated_identifier({"identifier": v})
+        assert got == v, f"{v!r} rejected: {err}"
+
+
+def test_install_identifier_rejects_non_https_schemes():
+    """file:// or ext:: would turn 'install a plugin' into something else."""
+    from api.nyx_plugins import _validated_identifier
+    for v in [
+        "file:///etc/passwd",
+        "ext::sh -c id",
+        "git@github.com:owner/repo.git",
+        "http://github.com/owner/repo",
+        "ssh://x/y",
+    ]:
+        got, err = _validated_identifier({"identifier": v})
+        assert got is None, f"{v!r} should be rejected"
+        assert err
+
+
+def test_install_identifier_rejects_flag_injection():
+    from api.nyx_plugins import _validated_identifier
+    for v in ["--force", "-f", "--ref=deadbeef"]:
+        assert _validated_identifier({"identifier": v})[0] is None
+
+
+def test_install_never_auto_enables():
+    """Installing and enabling are separate decisions.
+
+    A fresh install must not start executing inside the agent because someone
+    tapped once, and --no-enable also stops the CLI prompting for confirmation
+    (which would hang the subprocess).
+    """
+    import inspect
+    from api import nyx_plugins
+    src = inspect.getsource(nyx_plugins.handle_plugin_install)
+    assert '"--no-enable"' in src
+    assert '"--enable"' not in src
+
+
+def test_enable_never_grants_tool_override():
+    """A phone tap must not let a plugin replace shell_exec or write_file."""
+    import inspect
+    from api import nyx_plugins
+    src = inspect.getsource(nyx_plugins.handle_plugin_enable)
+    assert '"--no-allow-tool-override"' in src
+    assert '"--allow-tool-override"' not in src
+
+
+def test_plugin_writes_never_use_a_shell():
+    """Every CLI call goes through argv, never shell=True."""
+    import inspect
+    from api import nyx_plugins
+    src = inspect.getsource(nyx_plugins)
+    assert "shell=True" not in src
+
+
+def test_install_ref_must_be_a_full_sha(monkeypatch):
+    from api import nyx_plugins
+    h = _Stub()
+    nyx_plugins.handle_plugin_install(h, {"identifier": "owner/repo", "ref": "abc123"})
+    assert h.status == 400
+
+
+def test_mutations_report_restart_required(monkeypatch):
+    """Nothing here reloads the agent, so the response must say so."""
+    import inspect
+    from api import nyx_plugins
+    for fn in (nyx_plugins.handle_plugin_enable,
+               nyx_plugins.handle_plugin_disable,
+               nyx_plugins.handle_plugin_install):
+        assert '"restart_required": True' in inspect.getsource(fn)
+
+
+def test_search_rejects_a_flag_like_term():
+    from api import nyx_plugins
+    from urllib.parse import urlparse
+    h = _Stub()
+    nyx_plugins.handle_plugin_search(h, urlparse("/api/nyx/plugins/search?q=--refresh"))
+    assert h.status == 400
