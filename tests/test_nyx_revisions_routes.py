@@ -13,7 +13,6 @@ We don't spin up the full server because the existing test suite
 covers server boot elsewhere.
 """
 import json
-import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
@@ -22,11 +21,13 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-# Stub out the heavy framework imports that nyx_revisions pulls in
-# transitively. We only need the helpers (j/bad/safe_resolve) and the
-# session resolution, both of which we exercise via real session
-# creation below.
-sys.path.insert(0, "/home/ubuntu/hermes-webui")
+# NB: this used to `sys.path.insert(0, "/home/ubuntu/hermes-webui")` — the
+# DEPLOYED tree, not this repo. Run alone, that made these tests import
+# /home/ubuntu/hermes-webui/api/nyx_revisions.py and pass against whatever was
+# last deployed, while reporting green for the working copy. It only appeared
+# to test repo code in a full run, because an alphabetically earlier test
+# module had already imported `api.*` from the repo into sys.modules.
+# The repo root is on sys.path via pytest's rootdir; no insert is needed.
 
 
 # ── Tiny stub handler so we can call the real handle_* functions ────────────
