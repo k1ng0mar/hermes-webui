@@ -1,7 +1,8 @@
 """Nyx memory backends — native (MEMORY.md) + GalaxyMem if installed.
 
-GET /api/nyx/memory/backends
-GET /api/nyx/memory?backend=native|galaxymem
+GET  /api/nyx/memory/backends
+GET  /api/nyx/memory?backend=native|galaxymem
+POST /api/nyx/memory/forget  {id}   -> archive one GalaxyMem memory
 """
 from __future__ import annotations
 
@@ -11,7 +12,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from api.helpers import j
+from api.helpers import bad, j
 
 _PLUGIN = Path.home() / ".hermes" / "plugins" / "galaxymem"
 _DB = Path.home() / ".galaxymem" / "db"
@@ -63,6 +64,32 @@ for m in mems:
         "source_session_id": str(src) if src else None,
     })
 print(json.dumps(out))
+"""
+
+
+_FORGET = r"""
+import json, sys
+from pathlib import Path
+plug = Path.home() / ".hermes" / "plugins" / "galaxymem"
+if plug.exists():
+    sys.path.insert(0, str(plug))
+from galaxymem.store import Store
+from galaxymem.models import MemoryStatus
+mem_id = sys.argv[1]
+db = Path.home() / ".galaxymem" / "db"
+s = Store(db)
+s.open()
+try:
+    before = s.get_memory(mem_id)
+    if before is None:
+        print(json.dumps({"ok": False, "error": "not found"}))
+        raise SystemExit(0)
+    s.update_memory_status(mem_id, MemoryStatus.archived)
+    after = s.get_memory(mem_id)
+    status = getattr(getattr(after, "status", None), "value", None) or ""
+finally:
+    s.close()
+print(json.dumps({"ok": True, "id": mem_id, "status": status}))
 """
 
 
@@ -187,3 +214,59 @@ def _galaxymem_payload() -> dict:
         return _mems_to_payload(mems)
     except Exception as e:
         return {"nodes": [], "clusters": [], "backend": "galaxymem", "error": str(e)}
+
+
+def _run_forget(mem_id: str) -> dict:
+    """Archive one memory through the plugin's own store.
+
+    Runs out-of-process for the same reason reads do: the WebUI venv has no
+    pandas, which galaxymem.store needs to open the lance store.
+    """
+    last_err = "no python"
+    for py in ("/usr/bin/python3", sys.executable):
+        if not Path(py).exists():
+            continue
+        try:
+            proc = subprocess.run(
+                [py, "-c", _FORGET, mem_id],
+                capture_output=True,
+                text=True,
+                timeout=25,
+                check=False,
+            )
+        except Exception as e:
+            last_err = str(e)
+            continue
+        if proc.returncode == 0 and proc.stdout.strip():
+            try:
+                return json.loads(proc.stdout)
+            except json.JSONDecodeError as e:
+                last_err = f"writer json: {e}"
+                continue
+        last_err = (proc.stderr or "").strip().splitlines()[-1:] or [f"exit {proc.returncode}"]
+        last_err = last_err[0]
+    return {"ok": False, "error": last_err}
+
+
+def handle_forget(handler, body):
+    """POST /api/nyx/memory/forget {id}
+
+    Archives the memory — it is never hard-deleted. GalaxyMem's model marks
+    `archived` as "explicit user intent only (D13: never hard-deleted)", so the
+    row stays queryable and the client renders it struck through rather than
+    making it vanish.
+    """
+    if not isinstance(body, dict):
+        return bad(handler, "body must be an object")
+    mem_id = str(body.get("id") or "").strip()
+    if not mem_id:
+        return bad(handler, "id is required")
+    if len(mem_id) > 200:
+        return bad(handler, "id is too long")
+    if not _galaxymem_present():
+        return bad(handler, "GalaxyMem is not installed", 404)
+    result = _run_forget(mem_id)
+    if not result.get("ok"):
+        err = str(result.get("error") or "forget failed")
+        return bad(handler, err, 404 if "not found" in err.lower() else 500)
+    return j(handler, result)

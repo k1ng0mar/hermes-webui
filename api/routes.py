@@ -16620,6 +16620,9 @@ def handle_post(handler, parsed) -> bool:
         return handle_snapshot(handler, body)
 
     # 4b: artifact revisions (snapshot + revert)
+    if parsed.path == "/api/nyx/memory/forget":
+        from api.nyx_memory import handle_forget
+        return handle_forget(handler, body)
     if parsed.path == "/api/nyx/revisions/snapshot":
         from api.nyx_revisions import handle_revisions_snapshot
         return handle_revisions_snapshot(handler, body)

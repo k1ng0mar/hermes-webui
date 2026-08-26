@@ -753,3 +753,68 @@ def test_revision_summary_survives_a_deleted_working_file(rev_ws):
     s = revision_summary(rev_ws, "a.py")
     assert s["count"] == 1
     assert s.get("unstaged") is True
+
+
+# ── memory forget: archive, never delete ──────────────────────────────────
+
+
+def test_forget_requires_an_id():
+    from api.nyx_memory import handle_forget
+    h = _Stub()
+    handle_forget(h, {})
+    assert h.status == 400
+
+
+def test_forget_rejects_a_non_object_body():
+    from api.nyx_memory import handle_forget
+    h = _Stub()
+    handle_forget(h, "nope")
+    assert h.status == 400
+
+
+def test_forget_rejects_an_overlong_id():
+    from api.nyx_memory import handle_forget
+    h = _Stub()
+    handle_forget(h, {"id": "x" * 500})
+    assert h.status == 400
+
+
+def test_forget_404s_when_galaxymem_is_absent(monkeypatch):
+    """A missing plugin must be a clear 404, not a 500 from the subprocess."""
+    import api.nyx_memory as nm
+    monkeypatch.setattr(nm, "_galaxymem_present", lambda: False)
+    h = _Stub()
+    handle = nm.handle_forget
+    handle(h, {"id": "mem_1"})
+    assert h.status == 404
+
+
+def test_forget_archives_and_never_hard_deletes(monkeypatch):
+    """The writer script must call update_memory_status, not delete_memory.
+
+    GalaxyMem's own model documents `archived` as "explicit user intent only
+    (D13: never hard-deleted)", so a forget that deleted the row would violate
+    the store's contract.
+    """
+    import api.nyx_memory as nm
+    assert "update_memory_status" in nm._FORGET
+    assert "delete_memory" not in nm._FORGET
+    assert "MemoryStatus.archived" in nm._FORGET
+
+
+def test_forget_surfaces_a_writer_failure(monkeypatch):
+    import api.nyx_memory as nm
+    monkeypatch.setattr(nm, "_galaxymem_present", lambda: True)
+    monkeypatch.setattr(nm, "_run_forget", lambda i: {"ok": False, "error": "boom"})
+    h = _Stub()
+    nm.handle_forget(h, {"id": "mem_1"})
+    assert h.status == 500
+
+
+def test_forget_maps_not_found_to_404(monkeypatch):
+    import api.nyx_memory as nm
+    monkeypatch.setattr(nm, "_galaxymem_present", lambda: True)
+    monkeypatch.setattr(nm, "_run_forget", lambda i: {"ok": False, "error": "not found"})
+    h = _Stub()
+    nm.handle_forget(h, {"id": "mem_1"})
+    assert h.status == 404
