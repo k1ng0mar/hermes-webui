@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import parse_qs
 
 from api.helpers import bad, j
 
@@ -62,6 +63,98 @@ for m in mems:
         "last_recalled_at": lra_s,
         "used": bool(rc and rc > 0),
         "source_session_id": str(src) if src else None,
+    })
+print(json.dumps(out))
+"""
+
+
+_SEARCH = r"""
+import json, os, sys
+from pathlib import Path
+plug = Path.home() / ".hermes" / "plugins" / "galaxymem"
+if plug.exists():
+    sys.path.insert(0, str(plug))
+from galaxymem.store import Store
+
+query = os.environ.get("NYX_MEM_Q", "").strip()
+try:
+    limit = max(1, min(int(os.environ.get("NYX_MEM_K", "25")), 100))
+except ValueError:
+    limit = 25
+
+db = Path.home() / ".galaxymem" / "db"
+s = Store(db)
+s.open()
+try:
+    # Two real searches the store already implements. Keyword first so an exact
+    # term the user typed always wins its own query, then semantic neighbours
+    # fill the rest — a pure vector search buries a literal match under things
+    # that merely embed nearby, which reads as broken to someone who typed a
+    # word they know is in there.
+    hits = []
+    seen = set()
+    for finder in ("keyword_search", "vector_search"):
+        fn = getattr(s, finder, None)
+        if fn is None:
+            continue
+        try:
+            rows = fn(query, k=limit) or []
+        except Exception:
+            continue
+        for rec, score in rows:
+            mid = str(getattr(rec, "id", "") or "")
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+            hits.append((rec, float(score), finder))
+        if len(hits) >= limit:
+            break
+    ents = {e.id: getattr(e, "label", e.id) for e in (s.list_entities() or [])}
+finally:
+    s.close()
+
+def _snippet(text, needle, width=150):
+    # A window around the first case-insensitive hit. Without it the row shows
+    # the memory first line, so a match deeper in the body is invisible: the
+    # reader sees a result with no sign of the term they typed. Mirrors the
+    # session search match_preview. NOTE: no docstring here on purpose, this
+    # function lives inside an r-string script and a triple quote would close it.
+    if not text or not needle:
+        return ""
+    low = text.lower()
+    i = low.find(needle.lower())
+    if i < 0:
+        return text[:width].strip()
+    start = max(0, i - width // 3)
+    end = min(len(text), i + len(needle) + (2 * width) // 3)
+    out = text[start:end].strip().replace("\n", " ")
+    return ("…" if start > 0 else "") + out + ("…" if end < len(text) else "")
+
+
+out = []
+for m, score, how in hits[:limit]:
+    net = getattr(getattr(m, "network", None), "value", None) or str(getattr(m, "network", "") or "world")
+    status = getattr(getattr(m, "status", None), "value", None) or str(getattr(m, "status", "") or "")
+    text = (getattr(m, "text", None) or "").strip()
+    label = text.split("\n", 1)[0][:80] or str(m.id)
+    created = getattr(m, "created_at", None)
+    created_s = created.isoformat() if hasattr(created, "isoformat") else created
+    eids = getattr(m, "entity_ids", None) or []
+    cat = ents.get(eids[0], net) if eids else net
+    rc = getattr(m, "recall_count", 0) or 0
+    out.append({
+        "id": str(m.id),
+        "label": label,
+        "text": text,
+        "category": cat,
+        "network": net,
+        "status": status,
+        "score": round(score, 4),
+        "matched_by": how.replace("_search", ""),
+        "snippet": _snippet(text, query),
+        "created_at": created_s,
+        "recall_count": int(rc),
+        "used": bool(rc and rc > 0),
     })
 print(json.dumps(out))
 """
@@ -214,6 +307,57 @@ def _galaxymem_payload() -> dict:
         return _mems_to_payload(mems)
     except Exception as e:
         return {"nodes": [], "clusters": [], "backend": "galaxymem", "error": str(e)}
+
+
+def handle_search(handler, parsed):
+    """GET /api/nyx/memory/search?q=…&limit=N — search the memory store.
+
+    There was no memory search of any kind, so the phone could list 200 of
+    2,358 memories and never look for one. GalaxyMem's own Store already
+    implements `keyword_search` and `vector_search`; this exposes them rather
+    than inventing a substring scan next to them.
+
+    Runs out-of-process for the same reason reads do: the WebUI venv has no
+    pandas, which galaxymem.store needs to open the lance store.
+    """
+    qs = parse_qs(parsed.query or "")
+    q = (qs.get("q", [""])[0] or "").strip()
+    if not q:
+        return j(handler, {"results": [], "query": "", "backend": "galaxymem"})
+    try:
+        limit = max(1, min(int(qs.get("limit", ["25"])[0]), 100))
+    except (ValueError, TypeError):
+        return bad(handler, "limit must be an integer")
+
+    if not _galaxymem_present():
+        return j(handler, {
+            "results": [], "query": q, "backend": "galaxymem",
+            "error": "GalaxyMem db missing",
+        })
+
+    env = dict(os.environ, NYX_MEM_Q=q, NYX_MEM_K=str(limit))
+    last_err = "no python"
+    for py in ("/usr/bin/python3", sys.executable):
+        if not Path(py).exists():
+            continue
+        try:
+            proc = subprocess.run(
+                [py, "-c", _SEARCH], capture_output=True, text=True,
+                timeout=30, check=False, env=env,
+            )
+        except Exception as e:
+            last_err = str(e)
+            continue
+        if proc.returncode == 0 and proc.stdout.strip():
+            try:
+                rows = json.loads(proc.stdout)
+            except json.JSONDecodeError as e:
+                last_err = f"search json: {e}"
+                continue
+            return j(handler, {"results": rows, "query": q, "count": len(rows), "backend": "galaxymem"})
+        last_err = (proc.stderr or "").strip()[-300:] or f"exit {proc.returncode}"
+
+    return j(handler, {"results": [], "query": q, "backend": "galaxymem", "error": last_err})
 
 
 def _run_forget(mem_id: str) -> dict:

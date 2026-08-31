@@ -106,6 +106,7 @@ def handle_llm_router_get(handler):
                         "id": str(c.get("id") or ""),
                         "remaining": c.get("remaining"),
                         "note": c.get("note") or c.get("plan") or "",
+                        "reset_at": c.get("reset_at"),
                     }
                     for c in cards
                     if isinstance(c, dict) and c.get("id")
@@ -120,7 +121,7 @@ def handle_llm_router_get(handler):
                         remaining = float(remaining) if remaining is not None else None
                     except Exception:
                         remaining = None
-                    quota.append({"id": str(name), "remaining": remaining, "note": rec.get("note") or rec.get("plan") or ""})
+                    quota.append({"id": str(name), "remaining": remaining, "note": rec.get("note") or rec.get("plan") or "", "reset_at": rec.get("reset_at")})
         except Exception:
             pass
     return j(
@@ -243,6 +244,24 @@ def handle_llm_router_set_pool(handler, body):
     return j(handler, payload or {"ok": True, "pool": name, "entries": entries})
 
 
+def _card_reset_at(rec: dict):
+    """Soonest reset for a resetwatch card.
+
+    Cards carry no top-level ``reset_at``; the resets live one level down in
+    ``windows`` (a session window and a weekly window, typically). The soonest
+    of them is the one worth showing, since that is the next time anything
+    actually frees up.
+    """
+    if not isinstance(rec, dict):
+        return None
+    stamps = [rec.get("reset_at")] if rec.get("reset_at") else []
+    for w in rec.get("windows") or []:
+        if isinstance(w, dict) and w.get("reset_at"):
+            stamps.append(w["reset_at"])
+    stamps = [str(x) for x in stamps if x]
+    return min(stamps) if stamps else None
+
+
 def _read_quota() -> list:
     """Remaining-quota snapshots from quota.json. Empty list if not configured."""
     try:
@@ -277,7 +296,12 @@ def _read_quota() -> list:
                 remaining = float(remaining) if remaining is not None else None
             except Exception:
                 remaining = None
-            out.append({"id": rec["id"], "remaining": remaining, "note": rec.get("note") or rec.get("plan") or ""})
+            out.append({
+                "id": rec["id"],
+                "remaining": remaining,
+                "note": rec.get("note") or rec.get("plan") or "",
+                "reset_at": _card_reset_at(rec),
+            })
         return out
     items = raw.get("providers") if isinstance(raw, dict) else raw
     if isinstance(raw, dict) and not items:
@@ -294,7 +318,7 @@ def _read_quota() -> list:
                 remaining = float(remaining)
             except Exception:
                 remaining = None
-            out.append({"id": name, "remaining": remaining, "note": rec.get("note") or rec.get("plan") or ""})
+            out.append({"id": name, "remaining": remaining, "note": rec.get("note") or rec.get("plan") or "", "reset_at": rec.get("reset_at")})
     elif isinstance(items, list):
         for rec in items:
             if not isinstance(rec, dict):
@@ -307,7 +331,7 @@ def _read_quota() -> list:
                 remaining = float(remaining)
             except Exception:
                 remaining = None
-            out.append({"id": str(name), "remaining": remaining, "note": rec.get("note") or rec.get("plan") or ""})
+            out.append({"id": str(name), "remaining": remaining, "note": rec.get("note") or rec.get("plan") or "", "reset_at": rec.get("reset_at")})
     return out
 
 

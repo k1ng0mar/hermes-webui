@@ -13426,6 +13426,9 @@ def handle_get(handler, parsed) -> bool:
         from api.nyx_memory import handle_backends
         return handle_backends(handler)
 
+    if parsed.path == "/api/nyx/memory/search":
+        from api.nyx_memory import handle_search
+        return handle_search(handler, parsed)
     if parsed.path == "/api/nyx/memory/graph":
         from api.nyx_memory_graph import handle_graph
         return handle_graph(handler, parsed)
@@ -13447,6 +13450,9 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/nyx/skills/hub":
         from api.nyx_ops import handle_skills_hub
         return handle_skills_hub(handler, parsed)
+    if parsed.path == "/api/nyx/mcp/calls":
+        from api.nyx_ops import handle_mcp_calls
+        return handle_mcp_calls(handler, parsed)
     if parsed.path == "/api/nyx/mcp/catalog":
         from api.nyx_ops import handle_mcp_catalog
         return handle_mcp_catalog(handler)
@@ -18263,36 +18269,56 @@ def _handle_sessions_search(handler, parsed):
     })
 
 
+def _is_unusable_artifact_root(p) -> bool:
+    """True for roots that are not a workspace in any useful sense.
+
+    Most CLI sessions record their cwd as the user's home directory (or leave
+    it unset), and listing $HOME as "artifacts" produced a screen of Desktop,
+    Downloads, go/ and dotfile spill rather than anything the agent made. Home
+    and filesystem root are not workspaces; fall back to the real one.
+    """
+    try:
+        rp = Path(p).expanduser().resolve()
+    except Exception:
+        return True
+    return rp == Path.home().resolve() or rp == Path(rp.anchor)
+
+
 def _handle_artifacts(handler, parsed):
     """List real artifacts (type-aware, recency-sorted, noise-filtered)."""
     qs = parse_qs(parsed.query)
     sid = qs.get("session_id", [""])[0]
-    if not sid:
-        return bad(handler, "session_id is required")
     s = None
     workspace = ""
-    try:
-        s = get_session(sid)
-        workspace = s.workspace
-    except KeyError:
+    if sid:
         try:
-            cli_meta = None
-            for cs in get_cli_sessions():
-                if cs["session_id"] == sid:
-                    cli_meta = cs
-                    break
-            if not cli_meta:
-                return bad(handler, "Session not found", 404)
-            workspace = cli_meta.get("workspace", "")
-        except Exception:
-            return bad(handler, "Session not found", 404)
+            s = get_session(sid)
+            workspace = s.workspace
+        except KeyError:
+            try:
+                cli_meta = None
+                for cs in get_cli_sessions():
+                    if cs["session_id"] == sid:
+                        cli_meta = cs
+                        break
+                workspace = (cli_meta or {}).get("workspace", "")
+            except Exception:
+                workspace = ""
     try:
-        from api.artifacts import artifact_from_entry
-        workspace = resolve_trusted_workspace(workspace) if s is None else Path(
-            resolve_implicit_workspace_with_recovery(workspace, get_last_workspace)[0]
-        )
-        entries = list_dir(Path(workspace), ".")
-        artifacts = [a for e in entries if (a := artifact_from_entry(e))]
+        from api.artifacts import walk_artifacts
+        if workspace and not _is_unusable_artifact_root(workspace):
+            workspace = resolve_trusted_workspace(workspace) if s is None else Path(
+                resolve_implicit_workspace_with_recovery(workspace, get_last_workspace)[0]
+            )
+        else:
+            # No session, no recorded workspace, or a root that is really the
+            # home directory: use the configured default workspace (~/workspace
+            # unless HERMES_WEBUI_DEFAULT_WORKSPACE says otherwise).
+            from api.config import DEFAULT_WORKSPACE
+            workspace = Path(get_last_workspace() or DEFAULT_WORKSPACE)
+            if _is_unusable_artifact_root(workspace):
+                workspace = Path(DEFAULT_WORKSPACE)
+        artifacts = walk_artifacts(Path(workspace))
         artifacts.sort(key=lambda a: (a["mtime"] or 0), reverse=True)
         artifacts = artifacts[:60]
         # Design 4a: revision count, the "unstaged" chip and the +/- diff stat.
@@ -18303,7 +18329,7 @@ def _handle_artifacts(handler, parsed):
             from api.nyx_revisions import revision_summary
             ws = Path(workspace)
             for a in artifacts:
-                rel = a.get("path") or a.get("name")
+                rel = a.get("path") or a.get("id")
                 if not rel:
                     continue
                 try:
@@ -29158,8 +29184,55 @@ def _mcp_tools_from_registry(server_summaries):
     return tools
 
 
+def _mcp_tools_from_schema_cache(server_summaries):
+    """Tool names from the last successful schema probe on disk.
+
+    `_mcp_cached_tool_count` already reads this cache to keep a disconnected
+    server from reporting "0 tools" — but it only took len(tools) and dropped
+    the names, so /api/mcp/tools answered `source: none` while the very same
+    file held all 48 of unity-mcp's tools. That left the phone's per-server
+    tool chips permanently empty on any host whose MCP servers were configured
+    but not currently connected, which is the normal state.
+
+    These rows are the real inventory, just not live: every caller already
+    receives the server's `active: False` and `status` alongside, so a client
+    can say so.
+    """
+    try:
+        cache_path = os.path.join(
+            os.path.expanduser("~"), ".hermes", "cache", "mcp_schema_cache.json"
+        )
+        if not os.path.isfile(cache_path):
+            return []
+        with open(cache_path, encoding="utf-8") as fh:
+            data = json.loads(fh.read() or "{}")
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+
+    rows = []
+    for server_name, entry in data.items():
+        if not isinstance(entry, dict):
+            continue
+        cached = entry.get("tools")
+        if not isinstance(cached, list):
+            continue
+        summary = server_summaries.get(str(server_name))
+        if summary is None:
+            # Cached from a server that is no longer configured — skip it
+            # rather than inventing a server row for it.
+            continue
+        for tool in cached:
+            name = tool.get("name") if isinstance(tool, dict) else tool
+            if not name:
+                continue
+            rows.append(_mcp_tool_summary(str(name), tool, summary))
+    return rows
+
+
 def _handle_mcp_tools_list(handler):
-    """List known MCP tools from already-available runtime inventory only."""
+    """List known MCP tools from already-available inventory only."""
     cfg = get_config_for_profile_home(get_active_hermes_home())
     servers = cfg.get("mcp_servers", {})
     if not isinstance(servers, dict):
@@ -29174,6 +29247,12 @@ def _handle_mcp_tools_list(handler):
     if not tools:
         tools = _mcp_tools_from_registry(server_summaries)
         source = "tool_registry" if tools else "none"
+    if not tools:
+        # Neither the runtime nor the registry has anything, which is the
+        # ordinary state when no MCP server is connected. The schema cache is
+        # the last real source before giving up.
+        tools = _mcp_tools_from_schema_cache(server_summaries)
+        source = "schema_cache" if tools else "none"
     tools.sort(key=lambda row: (row.get("server", ""), row.get("name", "")))
     unavailable_servers = [
         summary["name"] for summary in server_summaries.values()

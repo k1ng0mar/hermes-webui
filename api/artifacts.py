@@ -65,3 +65,78 @@ def artifact_from_entry(entry: dict) -> dict | None:
         "mtime": mtime_ms,
         "previewable": kind != "file" and size <= MAX_PREVIEW_SIZE,
     }
+
+
+# Directories that are never artifact output, only machinery. Walking into
+# node_modules or .git turns a 40-file workspace into a 400,000-file one.
+SKIP_DIRS = {
+    "node_modules", ".git", ".hg", ".svn", "__pycache__", ".venv", "venv",
+    "env", ".mypy_cache", ".pytest_cache", ".ruff_cache", "dist", "build",
+    ".next", ".expo", ".gradle", ".idea", ".vscode", "target", "vendor",
+    "Pods", ".cache", ".tox", ".terraform", "site-packages",
+}
+
+# How deep to look. Agents write reports/ and docs/ one or two levels down;
+# past that you are in source trees, not artifacts.
+MAX_DEPTH = 3
+# Hard ceiling on files examined, so a wrong workspace root cannot hang the
+# request while it walks a home directory.
+SCAN_LIMIT = 4000
+
+
+def walk_artifacts(root: Path, max_depth: int = MAX_DEPTH, limit: int = SCAN_LIMIT) -> list[dict]:
+    """Artifacts under ``root``, recursively.
+
+    The listing used to be one non-recursive `list_dir(root, ".")`, so anything
+    the agent wrote into a subdirectory — which is most of what it writes — was
+    invisible. Symlinks are skipped outright rather than resolved: following
+    them is how a walk escapes the workspace it is supposed to be bounded by.
+    """
+    out: list[dict] = []
+    seen = 0
+    root = Path(root)
+
+    def walk(d: Path, rel: str, depth: int) -> None:
+        nonlocal seen
+        if depth > max_depth or seen >= limit:
+            return
+        try:
+            entries = sorted(os.scandir(d), key=lambda e: e.name)
+        except OSError:
+            return
+        for e in entries:
+            if seen >= limit:
+                return
+            seen += 1
+            name = e.name
+            if name.startswith("."):
+                continue
+            try:
+                if e.is_symlink():
+                    continue
+                if e.is_dir():
+                    if name in SKIP_DIRS:
+                        continue
+                    walk(Path(e.path), f"{rel}{name}/", depth + 1)
+                    continue
+                if not e.is_file():
+                    continue
+                if is_noise(name):
+                    continue
+                st = e.stat()
+            except OSError:
+                continue
+            path = f"{rel}{name}"
+            kind = kind_of(name)
+            out.append({
+                "id": path,
+                "path": path,          # what the revision lookup and file viewer need
+                "title": name,
+                "kind": kind,
+                "size": st.st_size,
+                "mtime": st.st_mtime * 1000.0,
+                "previewable": kind != "file" and st.st_size <= MAX_PREVIEW_SIZE,
+            })
+
+    walk(root, "", 0)
+    return out

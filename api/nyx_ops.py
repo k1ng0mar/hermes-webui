@@ -5,6 +5,7 @@ These wrap live Hermes CLI / profile stores. No invented numbers.
 from __future__ import annotations
 
 import calendar
+import datetime
 import json
 import logging
 import os
@@ -16,6 +17,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import parse_qs
 
 from api.helpers import bad, j
 from api.nyx_store import atomic_write_json, atomic_write_text, load_json
@@ -689,3 +691,63 @@ def handle_heartbeat_set(handler, body):
     finally:
         con.close()
     return j(handler, {"ok": True, "heartbeat": {**rec, "session_id": sid}})
+
+
+# ── MCP call counts (design 6e "41 calls today") ────────────────────────────
+
+# MCP tool calls are persisted on `messages.tool_name` namespaced as
+# `mcp__<server>__<tool>`, with the server slug lowercased and its dashes
+# turned into underscores (config `unity-mcp` → `unity_mcp`). That is the only
+# record of MCP activity anywhere: `get_mcp_status()` reports just
+# name/connected/disabled/tools/transport, and nothing in the agent or the
+# webui counts invocations. So this reads the message log rather than a
+# counter that does not exist.
+_MCP_TOOL_RE = re.compile(r"^mcp__([a-z0-9_]+?)__(.+)$", re.IGNORECASE)
+
+
+def handle_mcp_calls(handler, parsed):
+    """GET /api/nyx/mcp/calls?days=1 — per-server MCP invocation counts.
+
+    Returns counts only. A server with no activity in the window is simply
+    absent from the map, so a caller can render nothing rather than a zero.
+    """
+    qs = parse_qs(parsed.query or "")
+    try:
+        days = int((qs.get("days", ["1"])[0] or "1").strip())
+    except ValueError:
+        return bad(handler, "days must be an integer")
+    if days < 1 or days > 3650:
+        return bad(handler, "days must be between 1 and 3650")
+
+    if days == 1:
+        # "today" means since local midnight, not the last 24 hours — the
+        # label the UI shows says "today".
+        since = datetime.datetime.now().replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).timestamp()
+    else:
+        since = time.time() - days * 86400
+
+    calls: dict[str, int] = {}
+    tools: dict[str, dict[str, int]] = {}
+    con = sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True)
+    try:
+        rows = con.execute(
+            "SELECT tool_name FROM messages "
+            "WHERE tool_name LIKE 'mcp\\_\\_%' ESCAPE '\\' AND timestamp >= ?",
+            (since,),
+        )
+        for (tool_name,) in rows:
+            m = _MCP_TOOL_RE.match(tool_name or "")
+            if not m:
+                continue
+            server, tool = m.group(1).lower(), m.group(2)
+            calls[server] = calls.get(server, 0) + 1
+            tools.setdefault(server, {})
+            tools[server][tool] = tools[server].get(tool, 0) + 1
+    except sqlite3.Error as e:
+        return bad(handler, f"could not read the message log: {e}", 500)
+    finally:
+        con.close()
+
+    return j(handler, {"days": days, "since": since, "calls": calls, "tools": tools})
