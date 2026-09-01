@@ -6,6 +6,7 @@ password in Settings, registering passkeys, or configuring native OIDC SSO.
 import hashlib
 import hmac
 import http.cookies
+import ipaddress
 import json
 import logging
 import os
@@ -269,36 +270,62 @@ _login_attempts = _load_login_attempts()  # ip -> [timestamp, ...]
 _LOGIN_ATTEMPTS_LOCK = threading.Lock()
 
 
+def _login_ip_key(ip: str) -> str:
+    """Normalize an IP address for rate-limiting key.
+
+    IPv6 addresses are /64-prefix-normalized so autoconfig address changes don't
+    create separate buckets. IPv4 pass through verbatim. Non-IP strings (Unix
+    socket, unknown) pass through unchanged.
+    """
+    try:
+        addr = ipaddress.ip_address(ip.strip())
+        if isinstance(addr, ipaddress.IPv6Address):
+            # Mask to /64 — the first 64 bits (8 bytes) of the address.
+            # For IPv4-mapped IPv6 (::ffff:x.x.x.x) the mapped IPv4 is used,
+            # so they fall through to the IPv4 path below.
+            mapped = addr.ipv4_mapped
+            if mapped is not None:
+                return str(mapped)
+            prefix64 = addr.exploded.upper().rsplit(':', 4)[0]
+            return prefix64 + '::/64'
+        return str(addr)
+    except ValueError:
+        return ip
+
+
 def _check_login_rate(ip: str) -> bool:
     """Return True if the IP is allowed to attempt login (thread-safe)."""
+    key = _login_ip_key(ip)
     with _LOGIN_ATTEMPTS_LOCK:
         now = time.time()
-        attempts = _login_attempts.get(ip, [])
+        attempts = _login_attempts.get(key, [])
         # Prune old attempts
         attempts = [t for t in attempts if now - t < _LOGIN_WINDOW]
         if attempts:
-            _login_attempts[ip] = attempts
+            _login_attempts[key] = attempts
         else:
-            _login_attempts.pop(ip, None)
+            _login_attempts.pop(key, None)
         _save_login_attempts(_login_attempts)
         return len(attempts) < _LOGIN_MAX_ATTEMPTS
 
 
 def _record_login_attempt(ip: str) -> None:
     """Record a login attempt for rate limiting (thread-safe)."""
+    key = _login_ip_key(ip)
     with _LOGIN_ATTEMPTS_LOCK:
         now = time.time()
-        attempts = _login_attempts.get(ip, [])
+        attempts = _login_attempts.get(key, [])
         attempts.append(now)
-        _login_attempts[ip] = attempts
+        _login_attempts[key] = attempts
         _save_login_attempts(_login_attempts)
 
 
 def _clear_login_attempts(ip: str) -> None:
     """Clear failed login attempts after a successful login (thread-safe)."""
+    key = _login_ip_key(ip)
     with _LOGIN_ATTEMPTS_LOCK:
-        if ip in _login_attempts:
-            _login_attempts.pop(ip, None)
+        if key in _login_attempts:
+            _login_attempts.pop(key, None)
             _save_login_attempts(_login_attempts)
 
 

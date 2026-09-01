@@ -6190,6 +6190,22 @@ def _onboarding_gate_allows(handler, auth_enabled: bool | None = None) -> bool:
     return _onboarding_request_is_local(handler)
 
 
+def _client_ip_for_rate_limit(handler) -> str:
+    """Resolve the client IP for login rate-limiting.
+
+    Same trust model as the onboarding/local gate: honor forwarded headers only
+    when the raw socket peer is a trusted proxy AND the operator opted in via
+    HERMES_WEBUI_TRUST_FORWARDED_FOR. Otherwise the raw socket peer is
+    authoritative (it cannot be spoofed by a header). Falls back to the raw peer
+    when the chain is malformed/empty so the limiter still has a key.
+    """
+    if _truthy_env("HERMES_WEBUI_TRUST_FORWARDED_FOR") and _raw_peer_is_trusted_proxy(handler):
+        resolved = _forwarded_client_ip_from_trusted_proxy(handler)
+        if resolved:
+            return resolved
+    return _request_client_ip(handler) or "unknown"
+
+
 # Operator-facing copy reused by every embedded-terminal endpoint refusal.
 _EMBEDDED_TERMINAL_GATE_DENIED_MESSAGE = (
     "Embedded terminal is only available from local networks when authentication "
@@ -17722,7 +17738,7 @@ def handle_post(handler, parsed) -> bool:
 
         if not is_auth_enabled():
             return j(handler, {"ok": True, "message": "Auth not enabled"})
-        client_ip = handler.client_address[0]
+        client_ip = _client_ip_for_rate_limit(handler)
         if not _check_login_rate(client_ip):
             return j(
                 handler,
@@ -17770,7 +17786,7 @@ def handle_post(handler, parsed) -> bool:
             return j(handler, {"error": "Passkey support is disabled."}, status=404)
         if not is_auth_enabled():
             return j(handler, {"error": "Auth not enabled"}, status=400)
-        client_ip = handler.client_address[0]
+        client_ip = _client_ip_for_rate_limit(handler)
         if not _check_login_rate(client_ip):
             return j(handler, {"error": "Too many attempts. Try again in a minute."}, status=429)
         try:
