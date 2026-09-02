@@ -13083,6 +13083,24 @@ def handle_get(handler, parsed) -> bool:
             payload["bound_profile"] = session_info.get("bound_profile")
         return j(handler, payload)
 
+    if parsed.path == "/api/auth/csrf":
+        # CSRF token for non-shell API clients (nyx-mobile PWA). The web shell
+        # gets its token injected into index.html at render time; every other
+        # browser client needs this endpoint to obtain one for the
+        # X-Hermes-CSRF-Token header that _check_csrf demands on unsafe
+        # browser requests. Session-authenticated only; never cached.
+        from api.auth import CSRF_HEADER_NAME, csrf_token_for_session, is_auth_enabled, parse_cookie, verify_session
+
+        if not is_auth_enabled():
+            return j(handler, {"ok": True, "csrf_token": "", "header": CSRF_HEADER_NAME})
+        cookie_val = parse_cookie(handler) or ""
+        if not cookie_val or not verify_session(cookie_val):
+            return j(handler, {"error": "Authentication required"}, status=401)
+        token = csrf_token_for_session(cookie_val) or ""
+        if not token:
+            return j(handler, {"error": "Authentication required"}, status=401)
+        return j(handler, {"ok": True, "csrf_token": token, "header": CSRF_HEADER_NAME})
+
     if parsed.path.startswith("/api/share/"):
         token = parsed.path[len("/api/share/"):].strip()
         share = load_share(token)
