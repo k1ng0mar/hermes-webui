@@ -72,7 +72,17 @@ _LIMITS = {"k": (1, 24), "min_sim": (0.0, 0.99), "limit": (1, 20000), "iters": (
 
 
 _BUILDER = r'''
-import json, sys, math
+# GalaxyMem 0.2.0+ builder — SQLite backend (LanceDB removed upstream).
+#
+# Same graph contract as the old builder (nodes/edges/communities/coords), but
+# reads ~/.galaxymem/galaxymem.sqlite3 directly through stdlib sqlite3. Vectors
+# are stored as raw float32 blobs (384 dims), so numpy consumes them without
+# any intermediate library: no pandas, no lancedb, no galaxymem import needed.
+#
+# Interpreter must have numpy (hermes venv has it). sqlite-vec is NOT required:
+# the k-NN here is computed in numpy over the capped node set, not via the vec
+# extension, because we need full pairwise sims among the LIMIT nodes anyway.
+import json, sys, math, sqlite3
 from pathlib import Path
 
 K        = int(sys.argv[1])
@@ -81,48 +91,35 @@ LIMIT    = int(sys.argv[3])
 ITERS    = int(sys.argv[4])
 
 import numpy as np
-import lancedb
 
-DB = Path.home() / ".galaxymem" / "db"
-db = lancedb.connect(str(DB))
+DB = Path.home() / ".galaxymem" / "galaxymem.sqlite3"
+if not DB.exists():
+    # 0.2.0-legacy layout: a db/ directory with the file inside it.
+    legacy = Path.home() / ".galaxymem" / "db" / "galaxymem.sqlite3"
+    DB = legacy if legacy.exists() else DB
 
-def table_names(conn):
-    # lancedb renamed this: <=0.34 has table_names(), 0.36 has list_tables()
-    # returning a ListTablesResponse whose .tables holds the names.
-    for attr in ("list_tables", "table_names"):
-        fn = getattr(conn, attr, None)
-        if fn is None:
-            continue
-        try:
-            r = fn()
-        except Exception:
-            continue
-        if hasattr(r, "tables"):
-            return set(r.tables or [])
-        if isinstance(r, (list, tuple, set)):
-            return set(r)
-    return set()
+conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+conn.row_factory = sqlite3.Row
 
-names = table_names(db)
-
-# ── load ──────────────────────────────────────────────────────────────────
-mem = db.open_table("memories").to_pandas()
-# newest first, then cap: a truncated graph should keep recent memory
-if "created_at" in mem.columns:
-    mem = mem.sort_values("created_at", ascending=False, kind="mergesort")
-total_memories = len(mem)
-mem = mem.head(LIMIT).reset_index(drop=True)
+# newest first, then cap — a truncated graph should keep recent memory.
+# demoted memories are kept (they still inform the graph) but archived/superseded
+# are not part of the living store.
+mem = conn.execute(
+    "select id, text, vector, network, entity_ids, status, created_at, recall_count"
+    " from memories where status in ('active','demoted')"
+    " order by created_at desc limit ?",
+    (LIMIT,),
+).fetchall()
+total_memories = conn.execute("select count(*) from memories").fetchone()[0]
 n = len(mem)
 if n == 0:
     print(json.dumps({"nodes": [], "edges": [], "communities": [],
-                      "stats": {"memories_total": 0}}))
+                      "stats": {"memories_total": total_memories}}))
     raise SystemExit(0)
 
 ent_label = {}
-if "entities" in names:
-    e = db.open_table("entities").to_pandas()
-    for _, r in e.iterrows():
-        ent_label[str(r["id"])] = str(r.get("label") or r["id"])
+for r in conn.execute("select id, label from entities"):
+    ent_label[str(r["id"])] = str(r["label"] or r["id"])
 
 def parse_json_list(v):
     if v is None: return []
@@ -135,11 +132,26 @@ def parse_json_list(v):
     except Exception:
         return []
 
-ids   = [str(x) for x in mem["id"].tolist()]
+ids   = [str(r["id"]) for r in mem]
 index = {mid: i for i, mid in enumerate(ids)}
 
 # ── vectors ───────────────────────────────────────────────────────────────
-V = np.vstack([np.asarray(v, dtype=np.float32) for v in mem["vector"].tolist()])
+vecs = []
+keep_rows = []
+for idx_r, r in enumerate(mem):
+    blob = r["vector"]
+    if blob is None:
+        continue
+    v = np.frombuffer(blob, dtype=np.float32)
+    if v.size != 384:
+        continue
+    vecs.append(v)
+    keep_rows.append(idx_r)
+# Keep only rows with usable vectors; remap everything afterwards.
+if len(keep_rows) < len(mem):
+    mem = [mem[i] for i in keep_rows]
+    n = len(mem)
+V = np.vstack(vecs) if vecs else np.zeros((0, 384), dtype=np.float32)
 norms = np.linalg.norm(V, axis=1, keepdims=True)
 norms[norms == 0] = 1.0
 V = V / norms
@@ -188,29 +200,27 @@ edges = [{"a": a, "b": b, "kind": "semantic", "w": round(w, 4)}
 # ── stored edges ──────────────────────────────────────────────────────────
 stored_kinds = {}
 dropped_stored = 0
-if "edges" in names:
-    et = db.open_table("edges").to_pandas()
-    seen = set()
-    for _, r in et.iterrows():
-        a = index.get(str(r["from_id"]))
-        b = index.get(str(r["to_id"]))
-        if a is None or b is None:
-            dropped_stored += 1
-            continue
-        if a == b:
-            continue
-        kind = str(r.get("kind") or "related")
-        lo, hi = (a, b) if a < b else (b, a)
-        key = (lo, hi, kind)
-        if key in seen:
-            continue
-        seen.add(key)
-        try:
-            w = float(r.get("weight") or 1.0)
-        except Exception:
-            w = 1.0
-        edges.append({"a": lo, "b": hi, "kind": kind, "w": round(w, 4)})
-        stored_kinds[kind] = stored_kinds.get(kind, 0) + 1
+seen = set()
+for r in conn.execute("select from_id, to_id, kind, weight from edges"):
+    a = index.get(str(r["from_id"]))
+    b = index.get(str(r["to_id"]))
+    if a is None or b is None:
+        dropped_stored += 1
+        continue
+    if a == b:
+        continue
+    kind = str(r["kind"] or "related")
+    lo, hi = (a, b) if a < b else (b, a)
+    key = (lo, hi, kind)
+    if key in seen:
+        continue
+    seen.add(key)
+    try:
+        w = float(r["weight"] or 1.0)
+    except Exception:
+        w = 1.0
+    edges.append({"a": lo, "b": hi, "kind": kind, "w": round(w, 4)})
+    stored_kinds[kind] = stored_kinds.get(kind, 0) + 1
 
 # ── adjacency (undirected, union of all kinds) ─────────────────────────────
 adj = [[] for _ in range(n)]
@@ -280,8 +290,8 @@ community = np.array([remap[l] for l in labels], dtype=np.int32)
 # name each community by its most common category signal
 cat_of = []
 for i in range(n):
-    eids = [x for x in parse_json_list(mem["entity_ids"].iloc[i]) if x]
-    net = str(mem["network"].iloc[i] or "world")
+    eids = [x for x in parse_json_list(mem[i]["entity_ids"]) if x]
+    net = str(mem[i]["network"] or "world")
     cat_of.append(ent_label.get(eids[0], net) if eids else net)
 
 # Naming by most-common category is useless here: nearly every memory carries
@@ -315,7 +325,7 @@ def _terms(txt):
     return [w for w in out if w not in _STOP and not w.isdigit()]
 
 n_comms = len(ranked)
-node_terms = [set(_terms(str(mem["text"].iloc[i] or "")[:400])) for i in range(n)]
+node_terms = [set(_terms(str(mem[i]["text"] or "")[:400])) for i in range(n)]
 df = {}
 for c in range(n_comms):
     seen_terms = set()
@@ -479,9 +489,9 @@ def s(v, cap=None):
 
 nodes = []
 for i in range(n):
-    text = (str(mem["text"].iloc[i] or "")).strip()
+    text = (str(mem[i]["text"] or "")).strip()
     label = text.split("\n", 1)[0][:80] or ids[i]
-    rc = mem["recall_count"].iloc[i]
+    rc = mem[i]["recall_count"]
     try: rc = int(rc)
     except Exception: rc = 0
     nodes.append({
@@ -489,9 +499,9 @@ for i in range(n):
         "label": label,
         "preview": text[:120],
         "category": cat_of[i],
-        "network": s(mem["network"].iloc[i]) or "world",
-        "status": s(mem["status"].iloc[i]) or "",
-        "created_at": s(mem["created_at"].iloc[i]),
+        "network": s(mem[i]["network"]) or "world",
+        "status": s(mem[i]["status"]) or "",
+        "created_at": s(mem[i]["created_at"]),
         "recall_count": rc,
         "degree": int(degree[i]),
         "community": int(community[i]),
@@ -528,19 +538,28 @@ print(json.dumps({
 '''
 
 
+_SQLITE_DB = Path.home() / ".galaxymem" / "galaxymem.sqlite3"
+
+
+def _store_db() -> Path:
+    """The live GalaxyMem 0.2.0+ store (SQLite), with the legacy layout fallback."""
+    if _SQLITE_DB.exists():
+        return _SQLITE_DB
+    legacy = _DB / "galaxymem.sqlite3"
+    return legacy if legacy.exists() else _SQLITE_DB
+
+
 def _present() -> bool:
-    return _DB.exists() and (_DB / "memories.lance").exists()
+    db = _store_db()
+    return db.exists() and db.stat().st_size > 0
 
 
 def _db_stamp() -> float:
-    """Newest mtime across the lance tables — cheap change detector."""
-    newest = 0.0
+    """DB file mtime — cheap change detector for the build cache key."""
     try:
-        for p in _DB.glob("*.lance"):
-            newest = max(newest, p.stat().st_mtime)
+        return _store_db().stat().st_mtime
     except Exception:
-        pass
-    return newest
+        return 0.0
 
 
 def _clamp(name: str, raw, fallback):
@@ -570,10 +589,16 @@ def _build(p: dict) -> dict:
     env = dict(os.environ)
     if _PLUGIN.exists():
         env["PYTHONPATH"] = str(_PLUGIN) + os.pathsep + env.get("PYTHONPATH", "")
+    # numpy lives in the hermes venv; system python has none. The old builder
+    # needed lancedb (also venv-only), so try the venv first, then whatever.
+    venv_py = Path.home() / ".hermes" / "hermes-agent" / "venv" / "bin" / "python"
+    candidates = [str(venv_py), sys.executable, "/usr/bin/python3"]
+    seen: set[str] = set()
     last = "no interpreter"
-    for py in ("/usr/bin/python3", sys.executable):
-        if not Path(py).exists():
+    for py in candidates:
+        if py in seen or not Path(py).exists():
             continue
+        seen.add(py)
         try:
             proc = subprocess.run(
                 [py, "-c", _BUILDER, str(p["k"]), str(p["min_sim"]),
